@@ -18,9 +18,16 @@ Thank you for your cooperation.
 Target environments
 -------------------
 
-* Mac OS X 10.5 - 10.6
-* Xcode 3.2
+* macOS 11.0 or later (Apple Silicon + Intel)
+* Xcode 15+ recommended
 * Manual reference counting
+
+Apple Silicon notes
+-------------------
+
+* The Xcode project now uses `$(ARCHS_STANDARD)` with `SDKROOT = macosx`, so arm64 is built natively on Apple Silicon.
+* `MACOSX_DEPLOYMENT_TARGET` is set to `11.0` to align with Apple Silicon availability.
+* There is no public compiler flag to tune specifically for an "M5" CPU generation. Building as arm64 with modern Xcode/Clang already enables Apple Silicon-native code generation and optimization.
 
 Dependencies
 ------------
