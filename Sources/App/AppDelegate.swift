@@ -6,7 +6,7 @@ import SwiftUI
 /// SwiftUI App struct (e.g. applicationWillTerminate, Sparkle delegate).
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let runtime = AppRuntime.shared
-    private var statusItemController: StatusItemController?
+    var statusItemController: StatusItemController?
     private let pasteHarnessWindowController = PasteHarnessWindowController()
     private let isPasteUITestMode = ProcessInfo.processInfo.environment["CLIPMENU_UI_TEST_MODE"] == "1"
 
@@ -14,13 +14,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ensure persisted settings are hydrated and normalized before services read them.
         runtime.settings.reload()
+        let statusItemController = StatusItemController(runtime: runtime)
+        statusItemController.install(runtime: runtime)
+        self.statusItemController = statusItemController
+
         if isPasteUITestMode {
             pasteHarnessWindowController.show(modelContainer: runtime.modelContainer)
             return
         }
-        let statusItemController = StatusItemController(runtime: runtime)
-        statusItemController.install(runtime: runtime)
-        self.statusItemController = statusItemController
 
         // Register global hotkeys immediately. This should not depend on
         // SwiftData container readiness.
@@ -84,13 +85,13 @@ private final class PasteHarnessWindowController: NSWindowController, NSWindowDe
 
     private func makeWindow() -> NSWindow {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 180),
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Paste Integration"
-        window.contentMinSize = NSSize(width: 420, height: 180)
+        window.contentMinSize = NSSize(width: 1100, height: 820)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -109,7 +110,7 @@ private final class PasteHarnessWindowController: NSWindowController, NSWindowDe
 }
 
 @MainActor
-private final class StatusItemController: NSObject, NSMenuDelegate {
+final class StatusItemController: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private weak var runtime: AppRuntime?
     private let menu = NSMenu(title: "ClipMenu")
@@ -127,16 +128,61 @@ private final class StatusItemController: NSObject, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         button.image = NSImage(systemSymbolName: "clipboard.fill", accessibilityDescription: "ClipMenu")
         button.image?.isTemplate = true
+
+        // Set RTL once so submenus always open to the left. Done here rather than
+        // in menuNeedsUpdate to avoid triggering a re-call while the menu is live.
+        menu.userInterfaceLayoutDirection = .rightToLeft
+    }
+
+    func openMenuForTesting() {
+        menu.cancelTrackingWithoutAnimation()
+        menu.removeAllItems()
+        menuNeedsUpdate(menu)
+
+        if let button = statusItem.button {
+            button.performClick(nil)
+        } else {
+            statusItem.popUpMenu(menu)
+        }
+    }
+
+    func openMenuForTestingAsync() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            self.runtime?.hotkeyService.presentStatusMenuForTesting()
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        guard let runtime, let freshMenu = runtime.hotkeyService.makeStatusMenu() else { return }
+        // macOS re-calls menuNeedsUpdate while the menu is being tracked (e.g. when
+        // a submenu is about to open). Guard against mid-tracking rebuilds: removeAllItems()
+        // while the menu is live causes it to briefly blank out, appearing to disappear.
+        // Items are cleared in menuDidClose so the next genuine open triggers a fresh build.
+        guard menu.numberOfItems == 0 else { return }
+        guard let runtime, let freshMenu = runtime.hotkeyService.makeStatusMenu(buttonMaxX: statusButtonMaxX) else { return }
 
         while !freshMenu.items.isEmpty {
             let item = freshMenu.items[0]
             freshMenu.removeItem(item)
             menu.addItem(item)
         }
+
+        runtime.hotkeyService.prepareStatusMenuPreview(menu)
+    }
+
+    private var statusButtonMaxX: CGFloat {
+        guard let button = statusItem.button, let window = button.window else {
+            return NSScreen.main?.visibleFrame.maxX ?? 1440
+        }
+        return window.convertToScreen(button.frame).maxX
+    }
+
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        runtime?.hotkeyService.statusMenu(menu, willHighlight: item)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        runtime?.hotkeyService.statusMenuDidClose(menu)
+        menu.removeAllItems()  // Reset so menuNeedsUpdate rebuilds fresh on next open
     }
 }
