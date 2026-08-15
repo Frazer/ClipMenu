@@ -329,7 +329,14 @@ struct SnippetsPrefsView: View {
 
     private func commitSnippetRename(_ snippet: Snippet) {
         let trimmed = editingSnippetTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        snippet.title = trimmed.isEmpty ? snippet.title : trimmed
+        let newTitle = trimmed.isEmpty ? snippet.title : trimmed
+        snippet.title = newTitle
+        
+        // Auto-fill empty content with the new title
+        if snippet.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            snippet.content = newTitle
+        }
+        
         editingSnippetID = nil
         persist()
     }

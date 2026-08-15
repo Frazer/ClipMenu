@@ -131,7 +131,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         // Set RTL once so submenus always open to the left. Done here rather than
         // in menuNeedsUpdate to avoid triggering a re-call while the menu is live.
-        menu.userInterfaceLayoutDirection = .rightToLeft
+        // Native LTR alignment provides correct text flow
     }
 
     func openMenuForTesting() {

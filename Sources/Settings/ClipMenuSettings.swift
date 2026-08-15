@@ -41,7 +41,7 @@ final class ClipMenuSettings {
 
     // MARK: - Menu
 
-    var maxMenuItemTitleLength: Int = 20 { didSet { defaults.set(maxMenuItemTitleLength, forKey: "maxMenuItemTitleLength") } }
+    var maxMenuItemTitleLength: Int = 40 { didSet { defaults.set(maxMenuItemTitleLength, forKey: "maxMenuItemTitleLength") } }
     var numberOfItemsInline: Int = 0 { didSet { defaults.set(numberOfItemsInline, forKey: "numberOfItemsPlaceInline") } }
     var numberOfItemsInsideFolder: Int = 10 { didSet { defaults.set(numberOfItemsInsideFolder, forKey: "numberOfItemsPlaceInsideFolder") } }
     var numberedMenuItems: Bool = true { didSet { defaults.set(numberedMenuItems, forKey: "menuItemsAreMarkedWithNumbers") } }
@@ -88,6 +88,7 @@ final class ClipMenuSettings {
     // MARK: - Actions
 
     var enableAction: Bool = true { didSet { defaults.set(enableAction, forKey: "enableAction") } }
+    var actionModifierKey: Int = 0 { didSet { defaults.set(actionModifierKey, forKey: "actionModifierKey") } } // 0=Option, 1=Command, 2=Control, 3=Shift
     var invokeActionImmediately: Bool = false { didSet { defaults.set(invokeActionImmediately, forKey: "invokeActionImmediately") } }
     var controlClickBehavior: String = "popUpActionMenu" { didSet { defaults.set(controlClickBehavior, forKey: "controlClickBehavior") } }
     var shiftClickBehavior: String = "" { didSet { defaults.set(shiftClickBehavior, forKey: "shiftClickBehavior") } }
@@ -136,7 +137,7 @@ final class ClipMenuSettings {
         storeTypes = (defaults.dictionary(forKey: "storeTypes") as? [String: Bool]) ?? Self.defaultStoreTypes
         excludeApps = (defaults.array(forKey: "excludeApps") as? [[String: String]]) ?? Self.defaultExcludeApps
 
-        maxMenuItemTitleLength = intValue("maxMenuItemTitleLength", default: 20)
+        maxMenuItemTitleLength = intValue("maxMenuItemTitleLength", default: 40)
         numberOfItemsInline = intValue("numberOfItemsPlaceInline", default: 0)
         numberOfItemsInsideFolder = intValue("numberOfItemsPlaceInsideFolder", default: 10)
         numberedMenuItems = boolValue("menuItemsAreMarkedWithNumbers", default: true)
@@ -175,6 +176,7 @@ final class ClipMenuSettings {
         hotKeys = defaults.dictionary(forKey: "hotKeys") ?? Self.defaultHotKeys
 
         enableAction = boolValue("enableAction", default: true)
+        actionModifierKey = intValue("actionModifierKey", default: 0)
         invokeActionImmediately = boolValue("invokeActionImmediately", default: false)
         controlClickBehavior = stringValue("controlClickBehavior", default: "popUpActionMenu")
         shiftClickBehavior = stringValue("shiftClickBehavior", default: "")
@@ -219,7 +221,7 @@ final class ClipMenuSettings {
             "showStatusItem": true,
             "storeTypes": Self.defaultStoreTypes,
             "excludeApps": Self.defaultExcludeApps,
-            "maxMenuItemTitleLength": 20,
+            "maxMenuItemTitleLength": 40,
             "numberOfItemsPlaceInline": 0,
             "numberOfItemsPlaceInsideFolder": 10,
             "menuItemsAreMarkedWithNumbers": true,
@@ -255,6 +257,7 @@ final class ClipMenuSettings {
             "menuIconOfFileTypeTagForPICT": 0,
             "menuIconOfFileTypeForPICT": "pict",
             "enableAction": true,
+            "actionModifierKey": 0,
             "invokeActionImmediately": false,
             "controlClickBehavior": "popUpActionMenu",
             "shiftClickBehavior": "",

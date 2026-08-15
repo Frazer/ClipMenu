@@ -69,7 +69,7 @@ final class HotkeyService {
 
     @MainActor
     func applyStatusMenuDirection(to menu: NSMenu) {
-        popupMenu.applyRightToLeftLayout(to: menu)
+        // Obsolete (Native LTR layout handles text alignment beautifully alongside consistent minimumWidth locking)
     }
 
     @MainActor
@@ -269,18 +269,20 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     }
 
     private func popupAnchorOrigin(for menu: NSMenu, mouse: NSPoint) -> NSPoint {
-        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) else {
-            return mouse
-        }
-
-        let screenMidY = screen.frame.midY
-        guard mouse.y < screenMidY else {
-            return mouse
-        }
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main
+        let frame = screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
 
         let menuHeight = estimatedMenuHeight(for: menu)
-        let liftedY = min(mouse.y + menuHeight, screen.frame.maxY - 1)
-        return NSPoint(x: mouse.x, y: liftedY)
+        let bottomEdge = mouse.y - menuHeight
+        
+        let padding: CGFloat = 8
+        if bottomEdge < frame.minY + padding {
+            let requiredY = frame.minY + padding + menuHeight
+            let finalY = min(requiredY, frame.maxY - padding)
+            return NSPoint(x: mouse.x, y: finalY)
+        }
+
+        return mouse
     }
 
     private func estimatedMenuHeight(for menu: NSMenu) -> CGFloat {
@@ -315,68 +317,11 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         statusBarMenuRightEdge = buttonMaxX ?? fallbackMaxX
         let menuH = estimatedMenuHeight(for: menu)
         currentMenuFrame = NSRect(x: statusBarMenuRightEdge - statusBarMainMenuWidth, y: 0, width: statusBarMainMenuWidth, height: menuH)
-        applyRightToLeftLayout(to: menu)
         prepareMenuPreview(menu, settings: runtime.settings, includeRootDelegate: false)
         return menu
     }
 
-    fileprivate func applyRightToLeftLayout(to menu: NSMenu) {
-        menu.userInterfaceLayoutDirection = .rightToLeft
-        for item in menu.items {
-            fixItemForRTL(item)
-            if let submenu = item.submenu {
-                applyRightToLeftLayout(to: submenu)
-            }
-        }
-    }
-
-    /// Adjusts each item's layout so that in RTL menus:
-    /// - Submenu items  → arrow on LEFT, text left-aligned (indent clears arrow), icon on RIGHT ✓
-    /// - Non-submenu items with image → icon pinned to LEFT via text attachment (RTL would shift it right)
-    /// - Non-submenu items without image → text left-aligned, negative indent cancels RTL arrow column
-    private func fixItemForRTL(_ item: NSMenuItem) {
-        guard !item.isSeparatorItem, !item.title.isEmpty else { return }
-
-        let style = NSMutableParagraphStyle()
-        style.alignment = .left
-
-        if item.submenu != nil {
-            // RTL puts the submenu arrow on the LEFT and the item image on the RIGHT — correct.
-            // Indent text so it starts after the arrow column instead of overlapping it.
-            style.firstLineHeadIndent = 20
-            style.headIndent = 20
-            if item.attributedTitle == nil {
-                item.attributedTitle = NSAttributedString(string: item.title, attributes: [.paragraphStyle: style])
-            } else {
-                let mut = NSMutableAttributedString(attributedString: item.attributedTitle!)
-                mut.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: mut.length))
-                item.attributedTitle = mut
-            }
-        } else if let image = item.image, item.attributedTitle == nil {
-            // Keep title text FIRST so macOS type-to-select matches on the first character.
-            // Trailing attachment renders at the visual left in RTL + left-aligned paragraphs.
-            let attachment = NSTextAttachment()
-            attachment.image = image
-            attachment.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
-            let attStr = NSMutableAttributedString(string: "\(item.title)  ")
-            attStr.append(NSAttributedString(attachment: attachment))
-            attStr.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: attStr.length))
-            item.image = nil
-            item.attributedTitle = attStr
-        } else {
-            // No submenu — use negative indent to cancel the RTL arrow column padding (~20pt).
-            style.firstLineHeadIndent = -20
-            style.headIndent = -20
-            if item.attributedTitle == nil {
-                item.attributedTitle = NSAttributedString(string: item.title, attributes: [.paragraphStyle: style])
-            } else {
-                // e.g. thumbnail clip items that already have attributedTitle set
-                let mut = NSMutableAttributedString(attributedString: item.attributedTitle!)
-                mut.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: mut.length))
-                item.attributedTitle = mut
-            }
-        }
-    }
+    // Native LTR behavior preserves text alignment without structural hacks.
 
     @MainActor
     func prepareStatusMenuPreview(_ menu: NSMenu) {
@@ -447,11 +392,19 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     @MainActor
     private func showPreview(for previewItem: ClipPreviewItem) {
         previewedItemID = previewItem.persistentModelID
+        
+        let menuWindows = NSApp.windows.filter { $0.className == "NSMenuWindow" && $0.isVisible }
+        let combinedFrame = menuWindows.reduce(NSRect.null) { $0.union($1.frame) }
+        let actualMenuFrame = combinedFrame == .null ? currentMenuFrame : combinedFrame
+        
+        // Grab the absolute foremost Menu Window generated by AppKit
+        let topmostMenuWindow: NSWindow? = menuWindows.last
+        
         previewController.show(
             item: previewItem,
             near: previewAnchorPoint ?? NSEvent.mouseLocation,
-            menuFrame: currentMenuFrame,
-            parentWindow: anchorWindow.isVisible ? nil : nil
+            menuFrame: actualMenuFrame,
+            parentWindow: topmostMenuWindow
         )
     }
 
@@ -690,6 +643,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
     private func buildMenu(runtime: AppRuntime, context: ModelContext, kind: HotkeyMenuKind) -> NSMenu {
         let menu = NSMenu(title: "ClipMenu")
+        menu.minimumWidth = 240.0
         let settings = runtime.settings
 
         let fetchedClips = (try? context.fetch(FetchDescriptor<ClipEntry>(
@@ -703,7 +657,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
         let showSnippetsInMain = kind == .main
         let showHistory = kind != .snippets && kind != .actions
-        let showActionsInMain = kind == .main && settings.enableAction
+        let showActionsInMain = false
 
         if showSnippetsInMain && settings.positionOfSnippets == 0 {
             addSnippets(to: menu, folders: folders, settings: settings)
@@ -765,6 +719,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
         guard let targetClip = clips.first else {
             let submenu = NSMenu(title: "Actions")
+            submenu.minimumWidth = 240.0
             let empty = NSMenuItem(title: "No clips available", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             submenu.addItem(empty)
@@ -789,6 +744,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
             )
         if actionMenu.items.isEmpty {
             let submenu = NSMenu(title: "Actions")
+            submenu.minimumWidth = 240.0
             let empty = NSMenuItem(title: "No actions configured", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             submenu.addItem(empty)
@@ -867,6 +823,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
             let folderItem = NSMenuItem(title: folder.title, action: nil, keyEquivalent: "")
             folderItem.image = folderMenuIcon(settings: settings)
             let submenu = NSMenu(title: folder.title)
+            submenu.minimumWidth = 240.0
             for snippet in snippets {
                 let item = NSMenuItem(title: snippet.title, action: #selector(HotkeyPopupActionTarget.selectSnippetMenuItem(_:)), keyEquivalent: "")
                 item.target = actionTarget
@@ -922,6 +879,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
             folderItem.image = folderMenuIcon(settings: settings)
 
             let submenu = NSMenu(title: folderItem.title)
+            submenu.minimumWidth = 240.0
             for (idx, clip) in group.enumerated() {
                 let absoluteIndex = inlineCount + groupIndex * perFolder + idx
                 let itemNumber = listNumber(for: absoluteIndex, settings: settings)
@@ -974,7 +932,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
             firstLine = stripped
         }
 
-        let maxLen = max(settings.maxMenuItemTitleLength, 1)
+        let maxLen = max(settings.maxMenuItemTitleLength, 45) // Boost default bounds against old cached defaults of 20
         let trimmed: String
         if firstLine.count > maxLen {
             trimmed = String(firstLine.prefix(max(maxLen - 3, 0))) + "..."
@@ -1261,7 +1219,7 @@ private final class ClipPreviewPanelController {
         panel.isReleasedWhenClosed = false
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
-        panel.level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 300)
+        panel.level = .screenSaver // Maximum possible window-level to guarantee z-index superiority
         panel.hasShadow = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -1343,12 +1301,11 @@ private final class ClipPreviewPanelController {
 
         var origin: NSPoint
         if menuFrame != .zero {
-            let leftX = menuFrame.minX - size.width - 8
-            if leftX >= frame.minX + 8 {
-                // Enough room to the left — keep preview there.
-                origin = NSPoint(x: leftX, y: point.y - 40)
+            let spaceOnLeft = menuFrame.minX - frame.minX
+            let spaceOnRight = frame.maxX - menuFrame.maxX
+            if spaceOnLeft >= spaceOnRight {
+                origin = NSPoint(x: menuFrame.minX - size.width - 8, y: point.y - 40)
             } else {
-                // Not enough room to the left; place to the right of the menu.
                 origin = NSPoint(x: menuFrame.maxX + 8, y: point.y - 40)
             }
         } else {
@@ -1357,7 +1314,9 @@ private final class ClipPreviewPanelController {
                 origin.x = point.x - size.width - 56
             }
         }
+        
         origin.x = max(frame.minX + 8, origin.x)
+        origin.x = min(frame.maxX - size.width - 8, origin.x)
 
         if origin.y < frame.minY + 8 {
             origin.y = frame.minY + 8
@@ -1529,8 +1488,58 @@ private final class HotkeyPopupActionTarget: NSObject {
     }
 
     @objc func selectClipMenuItem(_ sender: NSMenuItem) {
-        guard let clip = sender.representedObject as? ClipEntry else { return }
-        selectClipEntry(clip)
+        guard let clip = sender.representedObject as? ClipEntry, let runtime else { return }
+        
+        let mask: NSEvent.ModifierFlags
+        switch runtime.settings.actionModifierKey {
+        case 1: mask = .command
+        case 2: mask = .control
+        case 3: mask = .shift
+        default: mask = .option
+        }
+        
+        if NSEvent.modifierFlags.contains(mask) {
+            handleActionPopup(for: clip, runtime: runtime)
+        } else {
+            selectClipEntry(clip)
+        }
+    }
+
+    private func handleActionPopup(for clip: ClipEntry, runtime: AppRuntime) {
+        Task { @MainActor in
+            guard let context = runtime.modelContainer?.mainContext else { return }
+            let roots = (try? context.fetch(FetchDescriptor<ActionNode>(
+                predicate: #Predicate<ActionNode> { $0.parent == nil },
+                sortBy: [SortDescriptor(\.sortIndex)]
+            ))) ?? []
+            
+            let actionsMenu = ActionMenuBuilder.makeMenu(
+                from: roots,
+                target: clip,
+                service: runtime.actionService,
+                // Using .pasteContext means it executes the action and dumps to pasteboard
+                executionContext: .pasteContext,
+                postAction: { [weak self] in
+                    await self?.pasteFromHotkeyAction()
+                }
+            )
+            actionsMenu.minimumWidth = 240.0
+            
+            if actionsMenu.items.isEmpty {
+                let empty = NSMenuItem(title: "No actions configured", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                actionsMenu.addItem(empty)
+            } else {
+                let titleItem = NSMenuItem(title: "Actions for selected clip", action: nil, keyEquivalent: "")
+                titleItem.isEnabled = false
+                actionsMenu.insertItem(titleItem, at: 0)
+                actionsMenu.insertItem(.separator(), at: 1)
+            }
+            
+            // Allow the main popup to vanish completely before triggering a new run loop popup
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            actionsMenu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        }
     }
 
     func selectClipEntry(_ clip: ClipEntry) {
@@ -1551,8 +1560,24 @@ private final class HotkeyPopupActionTarget: NSObject {
     }
 
     @objc func selectSnippetMenuItem(_ sender: NSMenuItem) {
-        guard let snippet = sender.representedObject as? Snippet else { return }
-        selectSnippetModel(snippet)
+        guard let snippet = sender.representedObject as? Snippet, let runtime else { return }
+        
+        let mask: NSEvent.ModifierFlags
+        switch runtime.settings.actionModifierKey {
+        case 1: mask = .command
+        case 2: mask = .control
+        case 3: mask = .shift
+        default: mask = .option
+        }
+        
+        if NSEvent.modifierFlags.contains(mask) {
+            let mockClip = ClipEntry()
+            mockClip.stringValue = snippet.content
+            mockClip.types = ["public.utf8-plain-text"]
+            handleActionPopup(for: mockClip, runtime: runtime)
+        } else {
+            selectSnippetModel(snippet)
+        }
     }
 
     func selectSnippetModel(_ snippet: Snippet) {
