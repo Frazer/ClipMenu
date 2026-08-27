@@ -107,6 +107,7 @@ struct PreviewAXSmokeRunner {
         try assertLeftPreview(
             previewFrame: previewFrame.frame,
             menuBounds: popupBounds.frame,
+            referenceFrame: row.frame,
             scenario: "status-preview"
         )
 
@@ -138,6 +139,7 @@ struct PreviewAXSmokeRunner {
         try assertLeftPreview(
             previewFrame: previewFrame.frame,
             menuBounds: submenuBounds.frame,
+            referenceFrame: submenuItem.frame,
             scenario: "status-submenu-preview"
         )
 
@@ -171,6 +173,7 @@ struct PreviewAXSmokeRunner {
         try assertLeftPreview(
             previewFrame: previewFrame.frame,
             menuBounds: menuBounds.frame,
+            referenceFrame: highlightedItem.frame,
             scenario: "keyboard-preview"
         )
 
@@ -198,6 +201,7 @@ struct PreviewAXSmokeRunner {
         try assertLeftPreview(
             previewFrame: previewFrame.frame,
             menuBounds: rootBounds.frame,
+            referenceFrame: submenuItem.frame,
             scenario: "submenu-preview"
         )
 
@@ -273,9 +277,19 @@ struct PreviewAXSmokeRunner {
 
         return matched!
     }
-    private static func assertLeftPreview(previewFrame: CGRect, menuBounds: CGRect, scenario: String) throws {
+    private static func assertLeftPreview(previewFrame: CGRect, menuBounds: CGRect, referenceFrame: CGRect, scenario: String) throws {
         if previewFrame.maxX > menuBounds.minX {
             throw SmokeFailure(description: "\(scenario): preview (maxX=\(previewFrame.maxX)) is not to the left of menu (minX=\(menuBounds.minX))")
+        }
+
+        let gap = menuBounds.minX - previewFrame.maxX
+        if gap > 16 {
+            throw SmokeFailure(description: "\(scenario): preview (maxX=\(previewFrame.maxX)) is too far from menu (minX=\(menuBounds.minX)), gap=\(gap)px > 16px")
+        }
+
+        let vertOffset = abs(previewFrame.midY - referenceFrame.midY)
+        if vertOffset > 36 {
+            throw SmokeFailure(description: "\(scenario): preview (midY=\(previewFrame.midY)) is not vertically aligned with item row (midY=\(referenceFrame.midY)), offset=\(vertOffset)px > 36px")
         }
     }
 
