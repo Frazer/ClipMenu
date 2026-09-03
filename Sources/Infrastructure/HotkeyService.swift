@@ -398,13 +398,48 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         )
     }
 
-    func dismissPreview() {
+    func dismissPreview(force: Bool = false) {
+        if !force && previewController.panelWindow.isVisible {
+            let mouse = NSEvent.mouseLocation
+            let hoverRegion = previewController.panelWindow.frame.insetBy(dx: -20, dy: -10)
+            if NSPointInRect(mouse, hoverRegion) {
+                scheduleDismissalCheck()
+                return
+            }
+        }
+
+        dismissTimer?.invalidate()
+        dismissTimer = nil
         previewDelayTimer?.invalidate()
         previewDelayTimer = nil
         pendingPreviewItem = nil
         previewRequestID += 1
         previewedItemID = nil
         previewController.hide()
+    }
+
+    private var dismissTimer: Timer?
+
+    private func scheduleDismissalCheck() {
+        dismissTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let mouse = NSEvent.mouseLocation
+                if self.previewController.panelWindow.isVisible {
+                    let hoverRegion = self.previewController.panelWindow.frame.insetBy(dx: -20, dy: -10)
+                    if !NSPointInRect(mouse, hoverRegion) {
+                        self.dismissPreview(force: true)
+                    }
+                } else {
+                    self.dismissTimer?.invalidate()
+                    self.dismissTimer = nil
+                }
+            }
+        }
+        dismissTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
     }
 
     func highlightTestNode(_ node: TestPopupNode?, anchorPoint: NSPoint?) {
@@ -517,7 +552,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
         if let menu, let item {
             let mouse = NSEvent.mouseLocation
-            if let windowFrame = activeMenuWindowFrame(containing: mouse) {
+            if !isUITestMode, let windowFrame = activeMenuWindowFrame(containing: mouse) {
                 currentMenuFrame = windowFrame
             } else {
                 let menuW = estimatedMenuWidth(for: menu)
@@ -542,7 +577,18 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
                 }
             }
 
-            previewAnchorPoint = mouse
+            let visibleItems = menu.items.filter { !$0.isHidden }
+            let itemIndex = max(visibleItems.firstIndex(of: item) ?? 0, 0)
+            let rowOffset = visibleItems.prefix(itemIndex).reduce(CGFloat(0)) { total, current in
+                total + menuItemHeight(current)
+            } + menuItemHeight(item) / 2
+            let calculatedRowY = currentMenuFrame.maxY - rowOffset
+
+            if NSPointInRect(mouse, currentMenuFrame) {
+                previewAnchorPoint = mouse
+            } else {
+                previewAnchorPoint = NSPoint(x: currentMenuFrame.midX, y: calculatedRowY)
+            }
         }
 
         let itemID = previewItem.persistentModelID
@@ -1267,6 +1313,8 @@ private final class ClipPreviewPanelController {
         }
     }
 
+    var panelWindow: NSWindow { panel }
+
     func show(item: ClipPreviewItem, near point: NSPoint, menuFrame: NSRect = .zero, parentWindow: NSWindow? = nil) {
         let size = ClipPreviewContentView.preferredSize(for: item)
         hostingController.rootView = AnyView(
@@ -1371,11 +1419,12 @@ private struct ClipPreviewContentView: View {
             }
 
             if let text = textPreview {
-                ScrollView {
-                    Text(text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
+                Text(text)
+                    .font(.system(size: NSFont.systemFontSize))
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
             }
         }
         .padding(14)
@@ -1425,13 +1474,13 @@ private struct ClipPreviewContentView: View {
     private static func preferredSizeForClip(_ clip: ClipEntry) -> CGSize {
         let horizontalPadding: CGFloat = 28
         let verticalPadding: CGFloat = 28
-        let maxWidth: CGFloat = 420
-        let minWidth: CGFloat = 180
-        let maxHeight: CGFloat = 360
+        let maxWidth: CGFloat = 480
+        let minWidth: CGFloat = 200
+        let maxHeight: CGFloat = 600
         let minHeight: CGFloat = 90
 
         if let image = clipImage(from: clip.imageData) {
-            let maxImageWidth: CGFloat = 360
+            let maxImageWidth: CGFloat = 380
             let maxImageHeight: CGFloat = 280
             let scale = min(maxImageWidth / max(image.size.width, 1),
                             maxImageHeight / max(image.size.height, 1),
@@ -1441,12 +1490,12 @@ private struct ClipPreviewContentView: View {
 
             if let text = clipTextPreview(for: clip) {
                 let textRect = text.boundingRect(
-                    with: NSSize(width: max(imageWidth, 220), height: 80),
+                    with: NSSize(width: max(imageWidth, 320), height: 1000),
                     options: [.usesLineFragmentOrigin, .usesFontLeading],
                     attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize)]
                 )
                 let width = min(max(max(imageWidth, ceil(textRect.width)) + horizontalPadding, minWidth), maxWidth)
-                let height = min(max(imageHeight + min(ceil(textRect.height), 64) + verticalPadding + 12, minHeight), maxHeight)
+                let height = min(max(imageHeight + min(ceil(textRect.height), 280) + verticalPadding + 12, minHeight), maxHeight)
                 return CGSize(width: width, height: height)
             }
 
@@ -1463,13 +1512,14 @@ private struct ClipPreviewContentView: View {
     private static func preferredSizeForText(_ text: String) -> CGSize {
         let horizontalPadding: CGFloat = 28
         let verticalPadding: CGFloat = 28
-        let maxWidth: CGFloat = 420
-        let minWidth: CGFloat = 180
-        let maxHeight: CGFloat = 360
+        let maxWidth: CGFloat = 480
+        let minWidth: CGFloat = 220
+        let maxHeight: CGFloat = 720
         let minHeight: CGFloat = 90
-        let textWidth: CGFloat = 320
+        let textWidth: CGFloat = 400
+
         let rect = text.boundingRect(
-            with: NSSize(width: textWidth, height: 240),
+            with: NSSize(width: textWidth, height: 3000),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize)]
         )

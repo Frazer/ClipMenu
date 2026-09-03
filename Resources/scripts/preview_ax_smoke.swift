@@ -32,6 +32,7 @@ struct PreviewAXSmokeRunner {
             ("keyboard-preview", runKeyboardPreviewScenario),
             ("submenu-preview", runSubmenuPreviewScenario),
             ("status-submenu-preview", runStatusSubmenuPreviewScenario),
+            ("scroll-preview", runScrollPreviewScenario),
         ]
 
         var results: [ScenarioResult] = []
@@ -213,6 +214,27 @@ struct PreviewAXSmokeRunner {
         )
     }
 
+    private static func runScrollPreviewScenario(context: AutomationContext) throws -> ScenarioResult {
+        try press(identifier: "openStatusPopupButton", in: context.appElement)
+        let row = try waitForRectLabel(identifier: "selectedRootRowFrameLabel", in: context.appElement)
+        moveMouse(to: convertToScreen(rect: row.frame, in: context.appElement).center)
+
+        let previewFrame = try waitForRectLabel(identifier: "previewFrameLabel", in: context.appElement)
+        let previewCenter = convertToScreen(rect: previewFrame.frame, in: context.appElement).center
+
+        moveMouse(to: previewCenter)
+        sendScroll(deltaY: -80, at: previewCenter)
+
+        let updatedPreviewFrame = try waitForRectLabel(identifier: "previewFrameLabel", in: context.appElement)
+
+        return ScenarioResult(
+            name: "scroll-preview",
+            previewFrame: updatedPreviewFrame.frame,
+            referenceFrame: row.frame,
+            allMenuBounds: previewFrame.frame
+        )
+    }
+
     private static func press(identifier: String, in root: AXUIElement) throws {
         guard let element = findElement(in: root, where: { element in
             stringAttribute(kAXIdentifierAttribute, of: element) == identifier
@@ -308,6 +330,21 @@ struct PreviewAXSmokeRunner {
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
         usleep(300_000)
+    }
+
+    private static func sendScroll(deltaY: Int32, at location: CGPoint) {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let event = CGEvent(
+            scrollWheelEvent2Source: source,
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: deltaY,
+            wheel2: 0,
+            wheel3: 0
+        )
+        event?.location = location
+        event?.post(tap: .cghidEventTap)
+        usleep(150_000)
     }
 }
 
