@@ -57,6 +57,10 @@ xcodebuild -project ClipMenu.xcodeproj -scheme ClipMenu -configuration Debug bui
 
 For detailed commands and troubleshooting, see `BUILD.md`.
 
+## Testing
+
+UI smoke scripts for previews and `/` filter (plus the in-process filter self-test) are documented in [`doc/testing.md`](doc/testing.md).
+
 ## Repository Cleanup Status
 
 - Legacy Objective-C source and historical release tooling were removed from the repository after migration completion.
