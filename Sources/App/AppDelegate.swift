@@ -47,6 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if ProcessInfo.processInfo.arguments.contains("--seed-clips") {
+            seedSampleClips(in: modelContext)
+        }
+
         if LegacyMigration.isNeeded {
             LegacyMigration.run(in: modelContext)
         }
@@ -55,6 +59,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runtime.clipsService.start(context: modelContext)
             await runtime.snippetService.start(context: modelContext)
             await runtime.actionService.start(context: modelContext)
+        }
+
+        if ProcessInfo.processInfo.arguments.contains("--open-hotkey-menu")
+            || ProcessInfo.processInfo.arguments.contains("--self-test-filter-slash") {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                self.runtime.hotkeyService.presentMainMenuForTesting()
+            }
+        }
+    }
+
+    @MainActor
+    private func seedSampleClips(in context: ModelContext) {
+        runtime.settings.numberOfItemsInline = 10
+        runtime.settings.showTooltipsInMenu = true
+        let count = (try? context.fetchCount(FetchDescriptor<ClipEntry>())) ?? 0
+        if count == 0 {
+            let entry1 = ClipEntry()
+            entry1.stringValue = "Sample Clip Entry 1: Hello World from ClipMenu!"
+            entry1.lastUsedAt = Date()
+            context.insert(entry1)
+
+            let entry2 = ClipEntry()
+            entry2.stringValue = "Sample Clip Entry 2: Multiline content\nLine 2\nLine 3\nLine 4"
+            entry2.lastUsedAt = Date().addingTimeInterval(-10)
+            context.insert(entry2)
+
+            try? context.save()
         }
     }
 
@@ -175,6 +207,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             return NSScreen.main?.visibleFrame.maxX ?? 1440
         }
         return window.convertToScreen(button.frame).maxX
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        runtime?.hotkeyService.statusMenuWillOpen(menu)
     }
 
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {

@@ -13,6 +13,7 @@
 		0938A392CFB62F3FB3BD66C1 /* ActionsPrefsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F33CC09804F1E54781E0EBD /* ActionsPrefsView.swift */; };
 		0A60516026B4A6A28329CA35 /* SnippetSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83A17B48EFB6F8C9C5953E6C /* SnippetSection.swift */; };
 		0E798AEE0574AA70D1CEFF73 /* HotkeyService.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBDD749FF754FE72E7DB47E6 /* HotkeyService.swift */; };
+		B2C3D4E53F60718293A4B5C6 /* FuzzyTextMatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D42E6F708192A3B4C5 /* FuzzyTextMatch.swift */; };
 		0EED262A561A43265F24BBF2 /* ActionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD6C21C72EE5244BB1D7613 /* ActionService.swift */; };
 		11B632FC9BBBFC5A6DFBA69C /* AppRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E215E86DBA662D409E0C3E8 /* AppRuntime.swift */; };
 		12D107DF0CA979EF876EF969 /* SnippetFolder.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAD0F7706C0E03012259C58E /* SnippetFolder.swift */; };
@@ -72,6 +73,7 @@
 		DD0EC1DDD1AFCBA2C875A51C /* ClipMenuApp+Scenes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ED996E53C34CFD8C7D0310C /* ClipMenuApp+Scenes.swift */; };
 		DD5D54D34CF0D365875C8B1F /* PasteIntegrationHarnessView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B9F12072DC8BC14BB901E66 /* PasteIntegrationHarnessView.swift */; };
 		E1DFEA8B6C7669DFC34FBC0C /* HotkeyService.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBDD749FF754FE72E7DB47E6 /* HotkeyService.swift */; };
+		C3D4E5F640718293A4B5C6D7 /* FuzzyTextMatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D42E6F708192A3B4C5 /* FuzzyTextMatch.swift */; };
 		E3A5BEAC6D55B0DBE1B56388 /* ActionSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E6321E93388B5BFB5F35292 /* ActionSection.swift */; };
 		EAA8E570AEAA9695CC422081 /* ActionMenuBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2071986765235444ED5C4B6 /* ActionMenuBuilder.swift */; };
 		ED4510E017E6C2AF79884815 /* ClipMenuItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0016B43E0CACE631C4CC81B1 /* ClipMenuItem.swift */; };
@@ -187,6 +189,7 @@
 		E3B5C233715C4B6C58F8E299 /* Calculate SHA-1 hash.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "Calculate SHA-1 hash.js"; sourceTree = "<group>"; };
 		E4A00A1E1A0D43947431A0E2 /* lowercase.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = lowercase.js; sourceTree = "<group>"; };
 		EBDD749FF754FE72E7DB47E6 /* HotkeyService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyService.swift; sourceTree = "<group>"; };
+		A1B2C3D42E6F708192A3B4C5 /* FuzzyTextMatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyTextMatch.swift; sourceTree = "<group>"; };
 		EBF7A7C9E337640DC76B28CB /* Convert Zenkaku alphanumeric characters to Hankaku.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "Convert Zenkaku alphanumeric characters to Hankaku.js"; sourceTree = "<group>"; };
 		EFE2D0E62C25351BA06254E5 /* UPPERCASE.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = UPPERCASE.js; sourceTree = "<group>"; };
 		F04ADA9E33388D3B40D982F8 /* Strip Tags.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "Strip Tags.js"; sourceTree = "<group>"; };
@@ -500,6 +503,7 @@
 			children = (
 				6CA10EBC72D8E5AE80FF0F4E /* AppExclusionService.swift */,
 				9075790B975D02A5039621CB /* ClipboardMonitor.swift */,
+				A1B2C3D42E6F708192A3B4C5 /* FuzzyTextMatch.swift */,
 				EBDD749FF754FE72E7DB47E6 /* HotkeyService.swift */,
 				B48E46B042ACC84B0F6F1766 /* LoginItemService.swift */,
 				D443B0D12EBBA794375C2643 /* PasteService.swift */,
@@ -673,6 +677,7 @@
 				5AAFFFB4377BC686C43EF82C /* EnvironmentKeys.swift in Sources */,
 				7A1B438249CE74198A1CA0C7 /* GeneralPrefsView.swift in Sources */,
 				0E798AEE0574AA70D1CEFF73 /* HotkeyService.swift in Sources */,
+				B2C3D4E53F60718293A4B5C6 /* FuzzyTextMatch.swift in Sources */,
 				7DC654982E118401EBAC78DA /* LegacyMigration.swift in Sources */,
 				C955BAEE63C16EFB4ECF2B56 /* LoginItemService.swift in Sources */,
 				7A7416876ADB8BAB01EAD0F4 /* MenuPrefsView.swift in Sources */,
@@ -713,6 +718,7 @@
 				40A1F4EED97AF8553F7672B0 /* EnvironmentKeys.swift in Sources */,
 				936E1E26F533AC6B39414F5D /* GeneralPrefsView.swift in Sources */,
 				E1DFEA8B6C7669DFC34FBC0C /* HotkeyService.swift in Sources */,
+				C3D4E5F640718293A4B5C6D7 /* FuzzyTextMatch.swift in Sources */,
 				21AD2E3FCA0D9D76AC02FA23 /* LegacyMigration.swift in Sources */,
 				D54B008B6D9741A0002054BB /* LoginItemService.swift in Sources */,
 				529A9D03AD998DAE8ADB2A00 /* MenuPrefsView.swift in Sources */,

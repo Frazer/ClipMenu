@@ -1,9 +1,12 @@
 import AppKit
+import ApplicationServices
 import KeyboardShortcuts
 import Foundation
 import os
 import SwiftData
 import SwiftUI
+import CoreGraphics
+import ObjectiveC
 
 extension Notification.Name {
     static let clipMenuHighlightDidChange = Notification.Name("ClipMenu.highlightDidChange")
@@ -43,6 +46,7 @@ final class HotkeyService {
     func register() {
         Self.log.info("Registering global shortcuts")
         ensureDefaultShortcutsIfMissing()
+        ClipMenuFilterKeyHook.prepareAtLaunch()
 
         // Trigger on key-up to avoid interacting with the menu while modifier
         // keys are still held down.
@@ -75,6 +79,11 @@ final class HotkeyService {
     @MainActor
     func statusMenu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
         popupMenu.menu(menu, willHighlight: item)
+    }
+
+    @MainActor
+    func statusMenuWillOpen(_ menu: NSMenu) {
+        popupMenu.beginSlashKeyMonitorForOpenMenu()
     }
 
     @MainActor
@@ -139,6 +148,552 @@ private enum PreviewSide {
     case right
 
     var flipped: PreviewSide { self == .left ? .right : .left }
+}
+
+// MARK: - Clip / snippet menu filtering
+
+private enum ClipMenuFilter {
+    static func apply(query: String, to rootMenu: NSMenu) {
+        resetVisibility(in: rootMenu)
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        applyRecursive(to: rootMenu, query: q)
+        trimRedundantSeparators(in: rootMenu)
+    }
+
+    private static func resetVisibility(in menu: NSMenu) {
+        for item in menu.items {
+            item.isHidden = false
+            if let sub = item.submenu {
+                resetVisibility(in: sub)
+            }
+        }
+    }
+
+    private static func applyRecursive(to menu: NSMenu, query: String) {
+        for item in menu.items {
+            if let sub = item.submenu {
+                applyRecursive(to: sub, query: query)
+                let anyVisible = sub.items.contains { !$0.isHidden && !$0.isSeparatorItem }
+                item.isHidden = !anyVisible
+            } else if let haystack = item.clipMenuFilterHaystack {
+                item.isHidden = !MenuFilterSubstring.matches(query, in: haystack)
+            }
+        }
+    }
+
+    private static func trimRedundantSeparators(in menu: NSMenu) {
+        var changed = true
+        while changed {
+            changed = false
+            var previousVisibleWasSeparator = true
+            for item in menu.items {
+                if item.isHidden { continue }
+                if item.isSeparatorItem {
+                    if previousVisibleWasSeparator {
+                        item.isHidden = true
+                        changed = true
+                    } else {
+                        previousVisibleWasSeparator = true
+                    }
+                } else {
+                    previousVisibleWasSeparator = false
+                }
+            }
+            if let last = menu.items.reversed().first(where: { !$0.isHidden }),
+               last.isSeparatorItem {
+                last.isHidden = true
+                changed = true
+            }
+        }
+    }
+}
+
+private func clipFilterHaystack(_ clip: ClipEntry) -> String {
+    var parts: [String] = []
+    if let s = clip.stringValue, !s.isEmpty { parts.append(s) }
+    if let f = clip.filenames { parts.append(contentsOf: f) }
+    if let u = clip.urlStrings { parts.append(contentsOf: u) }
+    if parts.isEmpty {
+        if clip.imageData != nil { parts.append("(Image)") }
+        if clip.pdfData != nil { parts.append("(PDF)") }
+    }
+    return parts.joined(separator: " ")
+}
+
+private func snippetFilterHaystack(snippet: Snippet, folderTitle: String) -> String {
+    [folderTitle, snippet.title, snippet.content].joined(separator: " ")
+}
+
+/// Search field that only accepts typing once activated (via `/`, highlight, or click).
+private final class ClipMenuSearchField: NSSearchField {
+
+    private var typingCaptureEnabled = false
+    private var inactivePlaceholder: String = "Push / to search"
+    private let caretOverlay = FilterCaretOverlayView(frame: .zero)
+    private var caretBlinkTimer: Timer?
+
+    var isTypingCaptureEnabledForTesting: Bool { typingCaptureEnabled }
+
+    override var acceptsFirstResponder: Bool {
+        typingCaptureEnabled
+    }
+
+    func activateForTypingFromMenuHighlight() {
+        typingCaptureEnabled = true
+        if let current = placeholderString, !current.isEmpty {
+            inactivePlaceholder = current
+        }
+        // Hide placeholder while active so the insertion point reads as the prompt.
+        placeholderString = ""
+        applyActiveAppearance(true)
+
+        // Focus for a real caret. Content-row highlight is suppressed while filter
+        // mode is active, so this no longer jumps the menu to row 1.
+        ensureInsertionPointVisible()
+        // Menu field editors often fail to blink until after the first edit — keep a
+        // fallback caret visible whenever filter mode is active.
+        startFallbackCaret()
+        realignSearchChrome()
+    }
+
+    /// After navigating with ↓ from the field, the menu owns keyboard again until filter is re-activated.
+    func releaseTypingCaptureForMenuNavigation() {
+        typingCaptureEnabled = false
+        placeholderString = inactivePlaceholder
+        applyActiveAppearance(false)
+        stopFallbackCaret()
+        window?.makeFirstResponder(nil)
+        realignSearchChrome()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        typingCaptureEnabled = true
+        super.mouseDown(with: event)
+        applyActiveAppearance(true)
+        ensureInsertionPointVisible()
+        startFallbackCaret()
+        realignSearchChrome()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok {
+            applyActiveAppearance(true)
+            ensureInsertionPointVisible()
+            startFallbackCaret()
+            realignSearchChrome()
+        }
+        return ok
+    }
+
+    override var stringValue: String {
+        didSet {
+            if typingCaptureEnabled {
+                positionFallbackCaret()
+            }
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        // AppKit drops the magnifying glass when the empty field editor attaches;
+        // re-assert button frames every layout pass.
+        (cell as? ClipMenuSearchFieldCell)?.recenterAccessoryButtons(in: bounds)
+        if typingCaptureEnabled {
+            positionFallbackCaret()
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        commonInit()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+
+    private func commonInit() {
+        let searchCell = ClipMenuSearchFieldCell(textCell: "")
+        searchCell.isEditable = true
+        searchCell.isSelectable = true
+        searchCell.isScrollable = true
+        searchCell.isBezeled = true
+        searchCell.bezelStyle = .roundedBezel
+        searchCell.placeholderString = inactivePlaceholder
+        searchCell.font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
+        searchCell.drawsBackground = true
+        searchCell.searchButtonCell?.isBordered = false
+        searchCell.cancelButtonCell?.isBordered = false
+        cell = searchCell
+
+        drawsBackground = true
+        textColor = .labelColor
+        focusRingType = .exterior
+        isBezeled = true
+        bezelStyle = .roundedBezel
+        applyActiveAppearance(false)
+
+        caretOverlay.isHidden = true
+        caretOverlay.wantsLayer = true
+        addSubview(caretOverlay)
+    }
+
+    private func applyActiveAppearance(_ active: Bool) {
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if active {
+            backgroundColor = dark
+                ? NSColor.white.withAlphaComponent(0.14)
+                : NSColor.black.withAlphaComponent(0.06)
+            textColor = .labelColor
+            focusRingType = .exterior
+        } else {
+            backgroundColor = dark
+                ? NSColor.white.withAlphaComponent(0.06)
+                : NSColor.black.withAlphaComponent(0.04)
+            textColor = .labelColor
+            focusRingType = .none
+        }
+        if let cell = cell as? NSSearchFieldCell {
+            cell.drawsBackground = true
+            cell.backgroundColor = backgroundColor
+        }
+        needsDisplay = true
+    }
+
+    private func realignSearchChrome() {
+        (cell as? ClipMenuSearchFieldCell)?.recenterAccessoryButtons(in: bounds)
+        needsDisplay = true
+        // Field-editor attach is async relative to focus; realign again next turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            (self.cell as? ClipMenuSearchFieldCell)?.recenterAccessoryButtons(in: self.bounds)
+            self.needsDisplay = true
+            if self.typingCaptureEnabled {
+                self.positionFallbackCaret()
+            }
+        }
+    }
+
+    /// Installs / wakes the field editor so an empty focused field still blinks a caret.
+    private func ensureInsertionPointVisible() {
+        let styleCaret: () -> Void = { [weak self] in
+            guard let self else { return }
+            let targetWindow = self.window ?? NSApp.keyWindow
+            guard let targetWindow else { return }
+
+            // `selectText` is what actually installs the field editor for an empty field.
+            if targetWindow.firstResponder !== self.currentEditor() {
+                targetWindow.makeFirstResponder(self)
+                self.selectText(nil)
+            }
+
+            guard let editor = (self.currentEditor() as? NSTextView)
+                ?? (targetWindow.fieldEditor(true, for: self) as? NSTextView)
+            else { return }
+
+            editor.isEditable = true
+            editor.isSelectable = true
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+            editor.textColor = .labelColor
+            // Hide system caret — menu field editors often don't blink until after an
+            // edit; our overlay caret is the reliable insertion point.
+            editor.insertionPointColor = .clear
+            let end = editor.string.utf16.count
+            editor.setSelectedRange(NSRange(location: end, length: 0))
+            editor.needsDisplay = true
+        }
+
+        styleCaret()
+        DispatchQueue.main.async(execute: styleCaret)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: styleCaret)
+    }
+
+    private func startFallbackCaret() {
+        positionFallbackCaret()
+        caretOverlay.isHidden = false
+        caretOverlay.alphaValue = 1
+        caretBlinkTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.53, repeats: true) { [weak self] _ in
+            guard let self, self.typingCaptureEnabled else { return }
+            self.caretOverlay.alphaValue = self.caretOverlay.alphaValue > 0.5 ? 0 : 1
+        }
+        caretBlinkTimer = timer
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopFallbackCaret() {
+        caretBlinkTimer?.invalidate()
+        caretBlinkTimer = nil
+        caretOverlay.isHidden = true
+        caretOverlay.alphaValue = 1
+    }
+
+    fileprivate func refreshFallbackCaret() {
+        guard typingCaptureEnabled else { return }
+        positionFallbackCaret()
+    }
+
+    private func positionFallbackCaret() {
+        let cellBounds = bounds
+        let drawing = (cell as? NSSearchFieldCell)?.drawingRect(forBounds: cellBounds)
+            ?? cellBounds.insetBy(dx: 28, dy: 4)
+        let font = self.font ?? NSFont.menuFont(ofSize: NSFont.systemFontSize)
+        let text = stringValue as NSString
+        let textWidth = text.size(withAttributes: [.font: font]).width
+        let caretHeight = max(font.pointSize + 2, 12)
+        let x = drawing.minX + min(textWidth, max(0, drawing.width - 2))
+        let y = drawing.midY - caretHeight / 2
+        caretOverlay.frame = NSRect(x: x.rounded(.towardZero), y: y.rounded(.towardZero), width: 1.5, height: caretHeight)
+        caretOverlay.updateColor(for: effectiveAppearance)
+        if typingCaptureEnabled {
+            caretOverlay.isHidden = false
+        }
+    }
+}
+
+/// Simple blinking insertion-point drawn above the search field (menu field editors are flaky).
+private final class FilterCaretOverlayView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.white.cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func updateColor(for appearance: NSAppearance) {
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.backgroundColor = (dark ? NSColor.white : NSColor.black).cgColor
+    }
+}
+
+/// Keeps the magnifying glass / cancel buttons vertically centered.
+/// Stock `NSSearchFieldCell` drops them when an empty field editor is attached.
+private final class ClipMenuSearchFieldCell: NSSearchFieldCell {
+
+    override func searchButtonRect(forBounds rect: NSRect) -> NSRect {
+        verticallyCentered(super.searchButtonRect(forBounds: rect), in: rect)
+    }
+
+    override func cancelButtonRect(forBounds rect: NSRect) -> NSRect {
+        verticallyCentered(super.cancelButtonRect(forBounds: rect), in: rect)
+    }
+
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        // Only inset horizontally for the search/cancel chrome. Leave AppKit's
+        // vertical metrics alone — shrinking height here hid the empty-field caret.
+        var drawing = super.drawingRect(forBounds: rect)
+        let search = searchButtonRect(forBounds: rect)
+        let cancel = cancelButtonRect(forBounds: rect)
+        let left = search.maxX + 2
+        let right = cancel.width > 0 ? cancel.minX - 2 : rect.maxX - 4
+        drawing.origin.x = left
+        drawing.size.width = max(0, right - left)
+        return drawing
+    }
+
+    fileprivate func recenterAccessoryButtons(in bounds: NSRect) {
+        // Drawing uses searchButtonRect(forBounds:) / cancelButtonRect(forBounds:);
+        // force those paths to repaint after the field editor attaches.
+        let searchRect = searchButtonRect(forBounds: bounds)
+        let cancelRect = cancelButtonRect(forBounds: bounds)
+        controlView?.setNeedsDisplay(searchRect.union(cancelRect))
+        controlView?.needsDisplay = true
+    }
+
+    private func verticallyCentered(_ buttonRect: NSRect, in bounds: NSRect) -> NSRect {
+        var centered = buttonRect
+        centered.origin.y = bounds.origin.y + ((bounds.height - buttonRect.height) / 2).rounded(.towardZero)
+        return centered
+    }
+}
+
+/// Single menu-row filter control: padded search field.
+private final class ClipMenuFilterBarView: NSView {
+    let searchField: ClipMenuSearchField
+
+    init(width: CGFloat) {
+        let height: CGFloat = 36
+        searchField = ClipMenuSearchField(frame: .zero)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        searchField.placeholderString = "Push / to search"
+        searchField.font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
+        searchField.setAccessibilityLabel("Push / to search")
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(searchField)
+
+        NSLayoutConstraint.activate([
+            searchField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            searchField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            searchField.heightAnchor.constraint(equalToConstant: 24),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 36)
+    }
+}
+
+/// Intercepts `/` (and filter typing) before NSMenu type-ahead steals keys.
+///
+/// Primary path: CFRunLoop `beforeSources` observer in `.eventTracking` that
+/// dequeues keyDowns from NSApp's queue (same Sonoma+ approach KeyboardShortcuts
+/// uses — Carbon `GetEventDispatcherTarget` no longer sees menu keys).
+/// Optional: CGEvent tap when Accessibility is granted (swallows earlier).
+private enum ClipMenuFilterKeyHook {
+    private static var eventTap: CFMachPort?
+    private static var runLoopSource: CFRunLoopSource?
+    private static var runLoopObserver: CFRunLoopObserver?
+    private static weak var activeTarget: HotkeyPopupActionTarget?
+    private(set) static var eventTapInstalled = false
+    private(set) static var runLoopMonitorInstalled = false
+
+    static func prepareAtLaunch() {
+        installEventTapIfNeeded()
+    }
+
+    static func setActiveTarget(_ target: HotkeyPopupActionTarget?) {
+        prepareAtLaunch()
+        activeTarget = target
+        startRunLoopMonitorIfNeeded()
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+        }
+    }
+
+    static func clearActiveTarget(_ target: HotkeyPopupActionTarget) {
+        if activeTarget === target {
+            activeTarget = nil
+            stopRunLoopMonitor()
+        }
+    }
+
+    private static func installEventTapIfNeeded() {
+        guard eventTap == nil else { return }
+
+        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: { _, type, event, _ in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = ClipMenuFilterKeyHook.eventTap {
+                        CGEvent.tapEnable(tap: tap, enable: true)
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                guard type == .keyDown else {
+                    return Unmanaged.passUnretained(event)
+                }
+                guard let target = ClipMenuFilterKeyHook.activeTarget else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                var consume = false
+                let handle = {
+                    consume = target.handleGlobalKeyDown(cgEvent: event)
+                }
+                if Thread.isMainThread {
+                    handle()
+                } else {
+                    DispatchQueue.main.sync(execute: handle)
+                }
+                return consume ? nil : Unmanaged.passUnretained(event)
+            },
+            userInfo: nil
+        ) else {
+            fputs("[ClipMenu] Filter key event tap unavailable — using run-loop monitor\n", stderr)
+            return
+        }
+
+        eventTap = tap
+        eventTapInstalled = true
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        fputs("[ClipMenu] Filter key event tap installed\n", stderr)
+    }
+
+    private static func startRunLoopMonitorIfNeeded() {
+        guard runLoopObserver == nil else { return }
+
+        let keyMask: NSEvent.EventTypeMask = [.keyDown]
+        let observer = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault,
+            CFRunLoopActivity.beforeSources.rawValue,
+            true,
+            0
+        ) { _, _ in
+            guard ClipMenuFilterKeyHook.activeTarget != nil else { return }
+
+            // Peek-only until a keyDown is at the head. Dequeuing while mouse-moved
+            // events lead would drain the menu's tracking flood and lag highlight.
+            var pendingToRepost: [NSEvent] = []
+            while
+                let head = NSApp.nextEvent(
+                    matching: .any,
+                    until: nil,
+                    inMode: .eventTracking,
+                    dequeue: false
+                ),
+                keyMask.contains(NSEvent.EventTypeMask(rawValue: 1 << head.type.rawValue)),
+                let event = NSApp.nextEvent(
+                    matching: keyMask,
+                    until: nil,
+                    inMode: .eventTracking,
+                    dequeue: true
+                )
+            {
+                let consumed: Bool
+                if let target = ClipMenuFilterKeyHook.activeTarget,
+                   let cgEvent = event.cgEvent {
+                    consumed = target.handleGlobalKeyDown(cgEvent: cgEvent)
+                } else {
+                    consumed = false
+                }
+                if !consumed {
+                    pendingToRepost.append(event)
+                }
+            }
+
+            for event in pendingToRepost.reversed() {
+                NSApp.postEvent(event, atStart: true)
+            }
+        }
+
+        runLoopObserver = observer
+        let mode = CFRunLoopMode(RunLoop.Mode.eventTracking.rawValue as CFString)
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, mode)
+        runLoopMonitorInstalled = true
+        fputs("[ClipMenu] Filter key run-loop monitor installed\n", stderr)
+    }
+
+    private static func stopRunLoopMonitor() {
+        guard let observer = runLoopObserver else { return }
+        let mode = CFRunLoopMode(RunLoop.Mode.eventTracking.rawValue as CFString)
+        CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, mode)
+        runLoopObserver = nil
+        runLoopMonitorInstalled = false
+    }
 }
 
 @MainActor
@@ -234,10 +789,12 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         previewSide = preferredPreviewSide(for: currentMenuFrame)
         knownMenuFrames = [currentMenuFrame]
         anchorWindow.orderFront(nil)
-        // startHighlightPolling(for: menu)
-        // if ProcessInfo.processInfo.arguments.contains("--open-hotkey-menu") {
-        //     showPreviewForTesting(in: menu)
-        // }
+        beginSlashKeyMonitorForOpenMenu()
+
+        let selfTestFilterSlash = ProcessInfo.processInfo.arguments.contains("--self-test-filter-slash")
+        if selfTestFilterSlash {
+            scheduleFilterSlashSelfTest(for: menu)
+        }
 
         NSApp.activate(ignoringOtherApps: true)
         if let contentView = anchorWindow.contentView {
@@ -249,6 +806,177 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         stopHighlightPolling()
         anchorWindow.orderOut(nil)
         HotkeyService.log.notice("Presented fallback NSMenu popup")
+    }
+
+    private func scheduleFilterSlashSelfTest(for menu: NSMenu) {
+        fputs("[FILTER SELFTEST] scheduled\n", stderr)
+        let timer = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
+            fputs("[FILTER SELFTEST] timer fired\n", stderr)
+            MainActor.assumeIsolated {
+                self?.runFilterSlashSelfTest(menu: menu)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func runFilterSlashSelfTest(menu: NSMenu) {
+        fputs("[FILTER SELFTEST] running\n", stderr)
+        ClipMenuFilterKeyHook.prepareAtLaunch()
+        // Ensure the run-loop monitor is armed (menu-open path also does this).
+        actionTarget.beginSlashKeyMonitorIfNeeded()
+
+        guard actionTarget.filterSearchField != nil else {
+            fputs("[FILTER SELFTEST] FAIL: filter search field missing\n", stderr)
+            Darwin.exit(1)
+        }
+
+        if let screen = NSScreen.main {
+            CGWarpMouseCursorPosition(CGPoint(x: screen.frame.minX + 2, y: screen.frame.minY + 2))
+        }
+        // Discover a working highlight API — setHighlightedItem: is absent on modern macOS.
+        let highlightCandidates = ["highlightItem:", "setHighlightedItem:", "_highlightItem:"]
+        var highlightSel: Selector?
+        for name in highlightCandidates {
+            let sel = NSSelectorFromString(name)
+            if menu.responds(to: sel) {
+                highlightSel = sel
+                fputs("[FILTER SELFTEST] highlight API=\(name)\n", stderr)
+                break
+            }
+        }
+        if highlightSel == nil {
+            var count: UInt32 = 0
+            if let list = class_copyMethodList(NSMenu.self, &count) {
+                defer { free(list) }
+                var found: [String] = []
+                for i in 0..<Int(count) {
+                    let name = NSStringFromSelector(method_getName(list[i]))
+                    if name.lowercased().contains("highlight") {
+                        found.append(name)
+                    }
+                }
+                fputs("[FILTER SELFTEST] NSMenu highlight methods=\(found)\n", stderr)
+            }
+        }
+
+        let clearSel = highlightSel ?? NSSelectorFromString("highlightItem:")
+
+        // Reproduce the user-visible bug: first content row is highlighted, then `/`.
+        let firstContent = menu.items.first { item in
+            item.view == nil
+                && item.isEnabled
+                && !item.isSeparatorItem
+                && !item.isHidden
+                && item.title.hasPrefix("1.")
+        }
+        if let firstContent, menu.responds(to: clearSel) {
+            menu.perform(clearSel, with: firstContent)
+            fputs("[FILTER SELFTEST] pre-highlighted '\(firstContent.title.prefix(40))' now=\(menu.highlightedItem?.title.prefix(40) ?? "nil")\n", stderr)
+        } else {
+            fputs("[FILTER SELFTEST] WARN: could not pre-highlight (selResponds=\(menu.responds(to: clearSel)))\n", stderr)
+        }
+
+        if actionTarget.isFilterModeActiveForTesting {
+            fputs("[FILTER SELFTEST] FAIL: filter mode already active before '/'\n", stderr)
+            Darwin.exit(1)
+        }
+
+        // Post real key events into the app queue — do NOT call handleGlobalKeyDown
+        // directly (that false-passed while AppKit still type-ahead-selected row 1).
+        let winNum = NSApp.keyWindow?.windowNumber
+            ?? actionTarget.filterSearchField?.window?.windowNumber
+            ?? 0
+
+        func postKey(_ keyCode: UInt16, chars: String) {
+            guard let down = NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: winNum,
+                context: nil,
+                characters: chars,
+                charactersIgnoringModifiers: chars,
+                isARepeat: false,
+                keyCode: keyCode
+            ) else { return }
+            // atStart so the eventTracking run-loop monitor sees it before menu type-ahead.
+            NSApp.postEvent(down, atStart: true)
+        }
+
+        postKey(44, chars: "/")
+
+        let evaluate = Timer(timeInterval: 0.45, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                let modeOn = self.actionTarget.isFilterModeActiveForTesting
+                let highlighted = menu.highlightedItem
+                let stillOnFirst = firstContent != nil && highlighted === firstContent
+                let jumpedToContent = stillOnFirst
+                    || highlighted?.representedObject is ClipEntry
+                    || highlighted?.representedObject is Snippet
+                    || (highlighted?.title.hasPrefix("1.") == true)
+
+                guard modeOn, !jumpedToContent else {
+                    fputs(
+                        "[FILTER SELFTEST] FAIL after '/': mode=\(modeOn) highlighted=\(highlighted?.title ?? "nil") jumped=\(jumpedToContent) stillFirst=\(stillOnFirst) runloop=\(ClipMenuFilterKeyHook.runLoopMonitorInstalled) tap=\(ClipMenuFilterKeyHook.eventTapInstalled)\n",
+                        stderr
+                    )
+                    menu.cancelTracking()
+                    Darwin.exit(1)
+                }
+
+                // Simulate cursor still sitting on the first row (common real-world case).
+                if let firstContent {
+                    self.actionTarget.clipMenuWillHighlight(menu: menu, item: firstContent)
+                    let modeAfterHover = self.actionTarget.isFilterModeActiveForTesting
+                    let highlightedAfterHover = menu.highlightedItem
+                    let hoverReselected = highlightedAfterHover === firstContent
+                        || highlightedAfterHover?.title.hasPrefix("1.") == true
+                    if !modeAfterHover || hoverReselected {
+                        fputs(
+                            "[FILTER SELFTEST] FAIL hover-after-/: mode=\(modeAfterHover) highlighted=\(highlightedAfterHover?.title ?? "nil") reselected=\(hoverReselected)\n",
+                            stderr
+                        )
+                        menu.cancelTracking()
+                        Darwin.exit(1)
+                    }
+                }
+
+                postKey(0, chars: "a")
+
+                let evaluate2 = Timer(timeInterval: 0.35, repeats: false) { _ in
+                    MainActor.assumeIsolated {
+                        let query = self.actionTarget.filterSearchField?.stringValue ?? ""
+                        let stillMode = self.actionTarget.isFilterModeActiveForTesting
+                        let highlighted2 = menu.highlightedItem
+                        let jumped2 = (firstContent != nil && highlighted2 === firstContent)
+                            || highlighted2?.representedObject is ClipEntry
+                            || highlighted2?.representedObject is Snippet
+                            || (highlighted2?.title.hasPrefix("1.") == true)
+
+                        if stillMode && query.lowercased().contains("a") && !jumped2 {
+                            fputs(
+                                "[FILTER SELFTEST] PASS: '/' filter mode; 'a' in query=\(query); no content jump (runloop=\(ClipMenuFilterKeyHook.runLoopMonitorInstalled) tap=\(ClipMenuFilterKeyHook.eventTapInstalled))\n",
+                                stderr
+                            )
+                            menu.cancelTracking()
+                            Darwin.exit(0)
+                        }
+                        fputs(
+                            "[FILTER SELFTEST] FAIL after 'a': mode=\(stillMode) query=\(query) highlighted=\(highlighted2?.title ?? "nil") jumped=\(jumped2)\n",
+                            stderr
+                        )
+                        menu.cancelTracking()
+                        Darwin.exit(1)
+                    }
+                }
+                RunLoop.main.add(evaluate2, forMode: .eventTracking)
+                RunLoop.main.add(evaluate2, forMode: .common)
+            }
+        }
+        RunLoop.main.add(evaluate, forMode: .eventTracking)
+        RunLoop.main.add(evaluate, forMode: .common)
     }
 
     private func popupPresentationPoint() -> NSPoint {
@@ -348,6 +1076,10 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     @MainActor
     func prepareStatusMenuPreview(_ menu: NSMenu) {
         prepareMenuPreview(menu, settings: currentSettings)
+        // Items were moved onto the live status menu — keep filter targeting that menu.
+        if actionTarget.filterSearchField != nil {
+            actionTarget.filterRootMenu = menu
+        }
     }
 
     @MainActor
@@ -404,12 +1136,26 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         previewController.hide()
         highlightedMenu = nil
         highlightedMenuItem = nil
+        clipMenuDidCloseCleanup()
         anchorWindow.orderOut(nil)
         testPopupStore.dismiss()
     }
 
+    fileprivate func clipMenuDidCloseCleanup() {
+        actionTarget.clipMenuFilterMenuDidClose()
+    }
+
+    fileprivate func beginSlashKeyMonitorForOpenMenu() {
+        actionTarget.beginSlashKeyMonitorIfNeeded()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        beginSlashKeyMonitorForOpenMenu()
+    }
+
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
         fputs("[DEBUG] menu:willHighlight item=\(item?.title ?? "nil") in menu=\(menu.title)\n", stderr)
+        actionTarget.clipMenuWillHighlight(menu: menu, item: item)
         handleHighlightedItem(item, in: menu)
     }
 
@@ -869,6 +1615,13 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         let menu = NSMenu(title: "ClipMenu")
         menu.minimumWidth = 240.0
         let settings = runtime.settings
+        if kind != .actions {
+            insertFilterMenuItems(into: menu)
+        } else {
+            actionTarget.filterRootMenu = nil
+            actionTarget.filterSearchField = nil
+            actionTarget.filterTitleMenuItem = nil
+        }
 
         let fetchedClips = (try? context.fetch(FetchDescriptor<ClipEntry>(
             sortBy: [SortDescriptor(\ClipEntry.lastUsedAt, order: .reverse)]
@@ -934,10 +1687,32 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quit)
 
+        if kind != .actions {
+            actionTarget.filterRootMenu = menu
+        }
+
         for (idx, item) in menu.items.enumerated() {
             fputs("[DEBUG MENU ITEM \(idx)] '\(item.title)' isSeparator=\(item.isSeparatorItem) hasSubmenu=\(item.submenu != nil) rep=\(String(describing: type(of: item.representedObject as Any)))\n", stderr)
         }
         return menu
+    }
+
+    private func insertFilterMenuItems(into menu: NSMenu) {
+        let width = max(estimatedMenuWidth(for: menu), 260)
+        let bar = ClipMenuFilterBarView(width: width)
+        bar.searchField.delegate = actionTarget
+
+        // Single search row. Do NOT set keyEquivalent to "/": AppKit then tries to
+        // highlight this view-backed item, fails, and jumps to the first regular row.
+        let filterItem = NSMenuItem(title: "Push / to search", action: nil, keyEquivalent: "")
+        filterItem.toolTip = "Push / to search, then type to filter"
+        filterItem.view = bar
+
+        actionTarget.filterTitleMenuItem = filterItem
+        actionTarget.filterSearchField = bar.searchField
+
+        menu.addItem(filterItem)
+        menu.addItem(.separator())
     }
 
     private func addActionsSubmenu(to menu: NSMenu, clips: [ClipEntry], context: ModelContext, runtime: AppRuntime) {
@@ -1055,6 +1830,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
                 let item = NSMenuItem(title: snippet.title, action: #selector(HotkeyPopupActionTarget.selectSnippetMenuItem(_:)), keyEquivalent: "")
                 item.target = actionTarget
                 item.representedObject = snippet
+                item.clipMenuFilterHaystack = snippetFilterHaystack(snippet: snippet, folderTitle: folder.title)
                 submenu.addItem(item)
             }
             folderItem.submenu = submenu
@@ -1092,6 +1868,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
             } else if clip.imageData != nil {
                 HotkeyService.log.debug("Inline popup clip has imageData but no thumbnail index=\(idx, privacy: .public) bytes=\(clip.imageData?.count ?? 0, privacy: .public)")
             }
+            item.clipMenuFilterHaystack = clipFilterHaystack(clip)
             menu.addItem(item)
         }
 
@@ -1125,6 +1902,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
                 } else if clip.imageData != nil {
                     HotkeyService.log.debug("Grouped popup clip has imageData but no thumbnail group=\(groupIndex, privacy: .public) idx=\(idx, privacy: .public) bytes=\(clip.imageData?.count ?? 0, privacy: .public)")
                 }
+                item.clipMenuFilterHaystack = clipFilterHaystack(clip)
                 submenu.addItem(item)
             }
 
@@ -1759,7 +2537,206 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     weak var runtime: AppRuntime?
     weak var targetAppForPaste: NSRunningApplication?
+    weak var filterRootMenu: NSMenu?
+    weak var filterSearchField: ClipMenuSearchField?
+    weak var filterTitleMenuItem: NSMenuItem?
+    /// True after `/` until Escape / ↓ / highlight leaves the filter.
+    private(set) var isFilterModeActive = false
+    private var isSuppressingContentHighlight = false
     private let pasteService = PasteService()
+
+    func beginSlashKeyMonitorIfNeeded() {
+        guard filterSearchField != nil else { return }
+        ClipMenuFilterKeyHook.setActiveTarget(self)
+    }
+
+    /// Called from the CGEvent tap on the main thread. Return true to swallow the key.
+    fileprivate func handleGlobalKeyDown(cgEvent: CGEvent) -> Bool {
+        guard filterSearchField != nil else { return false }
+
+        let flags = cgEvent.flags
+        if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
+            return false
+        }
+
+        let keyCode = cgEvent.getIntegerValueField(.keyboardEventKeycode)
+        let shift = flags.contains(.maskShift)
+
+        if !isFilterModeActive {
+            // Only `/` enters filter mode. Leave numbers/letters for menu type-ahead.
+            guard isUnmodifiedSlash(keyCode: keyCode, shift: shift, cgEvent: cgEvent) else {
+                return false
+            }
+            enterFilterMode()
+            return true
+        }
+
+        // Filter mode: own typing so the menu cannot type-ahead.
+        switch keyCode {
+        case 53: // escape
+            exitFilterMode(clearQuery: true)
+            return true
+        case 125: // down arrow — hand control back to the menu list
+            exitFilterMode(clearQuery: false)
+            return false
+        case 51: // delete
+            deleteLastFilterCharacter()
+            return true
+        case 36, 76: // return / keypad enter — stay in filter, don't activate a row
+            return true
+        case 48: // tab
+            return true
+        default:
+            if let chars = characters(from: cgEvent), !chars.isEmpty {
+                appendFilterCharacters(chars)
+                return true
+            }
+            // Unknown key while filtering — swallow to avoid accidental menu jumps.
+            return true
+        }
+    }
+
+    var isFilterModeActiveForTesting: Bool { isFilterModeActive }
+
+    private func enterFilterMode() {
+        isFilterModeActive = true
+        // IMPORTANT: never setHighlightedItem(filterRow). AppKit cannot highlight a
+        // view-backed row and jumps to the first real menu item — the bug users saw.
+        clearMenuHighlight()
+        filterSearchField?.activateForTypingFromMenuHighlight()
+        applyCurrentFilterQuery()
+        fputs("[ClipMenu] Filter mode ON\n", stderr)
+    }
+
+    private func exitFilterMode(clearQuery: Bool) {
+        isFilterModeActive = false
+        if clearQuery, let field = filterSearchField {
+            field.stringValue = ""
+            applyCurrentFilterQuery()
+        }
+        filterSearchField?.releaseTypingCaptureForMenuNavigation()
+        if let window = filterSearchField?.window ?? NSApp.keyWindow {
+            window.makeFirstResponder(nil)
+        }
+        fputs("[ClipMenu] Filter mode OFF\n", stderr)
+    }
+
+    private func clearMenuHighlight() {
+        guard let menu = filterTitleMenuItem?.menu else { return }
+        // Modern AppKit exposes `highlightItem:` (private). `setHighlightedItem:` does not exist.
+        for name in ["highlightItem:", "setHighlightedItem:", "_highlightItem:"] {
+            let sel = NSSelectorFromString(name)
+            guard menu.responds(to: sel) else { continue }
+            menu.perform(sel, with: nil)
+            return
+        }
+    }
+
+    private func appendFilterCharacters(_ chars: String) {
+        guard let field = filterSearchField else { return }
+        field.stringValue += chars
+        syncFilterFieldEditor(field)
+        applyCurrentFilterQuery()
+    }
+
+    private func deleteLastFilterCharacter() {
+        guard let field = filterSearchField, !field.stringValue.isEmpty else { return }
+        field.stringValue.removeLast()
+        syncFilterFieldEditor(field)
+        applyCurrentFilterQuery()
+    }
+
+    private func syncFilterFieldEditor(_ field: ClipMenuSearchField) {
+        guard let window = field.window ?? NSApp.keyWindow,
+              let editor = window.fieldEditor(false, for: field) as? NSTextView
+        else {
+            field.refreshFallbackCaret()
+            return
+        }
+        if editor.string != field.stringValue {
+            editor.string = field.stringValue
+        }
+        let end = editor.string.utf16.count
+        editor.setSelectedRange(NSRange(location: end, length: 0))
+        editor.insertionPointColor = .clear
+        field.refreshFallbackCaret()
+    }
+
+    private func applyCurrentFilterQuery() {
+        guard let field = filterSearchField else { return }
+        let menu = field.enclosingMenuItem?.menu ?? filterRootMenu
+        guard let menu else { return }
+        ClipMenuFilter.apply(query: field.stringValue, to: menu)
+    }
+
+    private func isUnmodifiedSlash(keyCode: Int64, shift: Bool, cgEvent: CGEvent) -> Bool {
+        if keyCode == 75 { return true } // keypad /
+        if keyCode == 44 { return !shift } // `/` vs `?`
+        if let chars = characters(from: cgEvent), chars == "/" { return true }
+        return false
+    }
+
+    private func characters(from cgEvent: CGEvent) -> String? {
+        guard let nsEvent = NSEvent(cgEvent: cgEvent) else { return nil }
+        return nsEvent.characters
+    }
+
+    /// Mouse highlight: hovering the filter row can enter filter mode. While filtering,
+    /// content-row hover must NOT exit filter mode (mouse often still sits on row 1 after `/`).
+    func clipMenuWillHighlight(menu: NSMenu, item: NSMenuItem?) {
+        guard let field = filterSearchField, let filterItem = filterTitleMenuItem else { return }
+        let isFilterRow = item === filterItem
+            || (item?.view != nil && field.isDescendant(of: item!.view!))
+        if isFilterRow {
+            if !isFilterModeActive {
+                enterFilterMode()
+            }
+            return
+        }
+        if isFilterModeActive {
+            // Suppress content highlight while filtering — otherwise AppKit immediately
+            // re-highlights the row under the cursor and `/` looks like it "selected" it.
+            if item != nil, !isSuppressingContentHighlight {
+                isSuppressingContentHighlight = true
+                defer { isSuppressingContentHighlight = false }
+                clearMenuHighlight()
+            }
+            return
+        }
+    }
+
+    func clipMenuFilterMenuDidClose() {
+        isFilterModeActive = false
+        ClipMenuFilterKeyHook.clearActiveTarget(self)
+        filterSearchField?.releaseTypingCaptureForMenuNavigation()
+        if let field = filterSearchField {
+            field.stringValue = ""
+        }
+    }
+
+    private func moveFilterFocusToMenuList(field: ClipMenuSearchField) {
+        exitFilterMode(clearQuery: false)
+        let winNum = field.window?.windowNumber ?? NSApp.keyWindow?.windowNumber ?? 0
+        DispatchQueue.main.async { [weak self] in
+            self?.repostMenuListArrowKeyDown(windowNumber: winNum)
+        }
+    }
+
+    private func repostMenuListArrowKeyDown(windowNumber: Int) {
+        guard let replay = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: windowNumber,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: 125
+        ) else { return }
+        NSApp.postEvent(replay, atStart: false)
+    }
 
     @MainActor
     private func reactivateTargetAppIfNeeded() {
@@ -1903,5 +2880,27 @@ private final class HotkeyPopupActionTarget: NSObject {
     @MainActor
     func pasteFromHotkeyAction() async {
         await pasteService.paste()
+    }
+}
+
+extension HotkeyPopupActionTarget: NSSearchFieldDelegate {
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? ClipMenuSearchField,
+              field === filterSearchField else { return }
+        if !isFilterModeActive {
+            isFilterModeActive = true
+        }
+        let menu = field.enclosingMenuItem?.menu ?? filterRootMenu
+        guard let menu else { return }
+        ClipMenuFilter.apply(query: field.stringValue, to: menu)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard let field = filterSearchField, control === field else { return false }
+        if commandSelector == #selector(NSResponder.moveDown(_:)) {
+            moveFilterFocusToMenuList(field: field)
+            return true
+        }
+        return false
     }
 }

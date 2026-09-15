@@ -3,10 +3,6 @@
 build with team code
 97988GNC59
 
-check mouseover works for text and image on both version
-
-add search/filter functionality
-
 
 when you make a title of a snippet, that should appear in the content if the content is empty
 
