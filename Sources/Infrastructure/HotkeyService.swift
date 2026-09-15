@@ -134,6 +134,13 @@ private enum HotkeyMenuKind {
     case actions
 }
 
+private enum PreviewSide {
+    case left
+    case right
+
+    var flipped: PreviewSide { self == .left ? .right : .left }
+}
+
 @MainActor
 private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     private let actionTarget = HotkeyPopupActionTarget()
@@ -148,11 +155,16 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     private var currentSettings: ClipMenuSettings?
     private var previewAnchorPoint: NSPoint?
     private var activeMenuOrigin: NSPoint?
+    private var rootMenuFrame: NSRect = .zero
     private var currentMenuFrame: NSRect = .zero
+    private var previewSide: PreviewSide = .right
+    private var knownMenuFrames: [NSRect] = []
     private var isStatusBarMenu = false
     private var statusBarMainMenuWidth: CGFloat = 0
     private var statusBarMenuRightEdge: CGFloat = 0
     private var previewRequestID = 0
+    private weak var highlightedMenu: NSMenu?
+    private weak var highlightedMenuItem: NSMenuItem?
     private lazy var anchorWindow: NSWindow = {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
@@ -218,9 +230,16 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         let menuH = estimatedMenuHeight(for: menu)
         let menuW = estimatedMenuWidth(for: menu)
         currentMenuFrame = NSRect(x: anchorOrigin.x, y: anchorOrigin.y - menuH, width: menuW, height: menuH)
+        rootMenuFrame = currentMenuFrame
+        previewSide = preferredPreviewSide(for: currentMenuFrame)
+        knownMenuFrames = [currentMenuFrame]
         anchorWindow.orderFront(nil)
-        startHighlightPolling(for: menu)
+        // startHighlightPolling(for: menu)
+        // if ProcessInfo.processInfo.arguments.contains("--open-hotkey-menu") {
+        //     showPreviewForTesting(in: menu)
+        // }
 
+        NSApp.activate(ignoringOtherApps: true)
         if let contentView = anchorWindow.contentView {
             menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: contentView)
         } else {
@@ -317,6 +336,9 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         let menuH = estimatedMenuHeight(for: menu)
         let screenMaxY = screen?.visibleFrame.maxY ?? 900
         currentMenuFrame = NSRect(x: statusBarMenuRightEdge - statusBarMainMenuWidth, y: screenMaxY - menuH, width: statusBarMainMenuWidth, height: menuH)
+        rootMenuFrame = currentMenuFrame
+        previewSide = .left
+        knownMenuFrames = [currentMenuFrame]
         prepareMenuPreview(menu, settings: runtime.settings)
         return menu
     }
@@ -330,13 +352,25 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
     @MainActor
     func showPreviewForTesting(in menu: NSMenu) {
-        guard let item = menu.items.first(where: { $0.representedObject is ClipEntry }),
+        guard let item = findFirstClipItem(in: menu),
               let clip = item.representedObject as? ClipEntry else { return }
 
         previewAnchorPoint = previewAnchorPoint(for: item, in: menu)
         pendingPreviewItem = nil
         previewRequestID += 1
         showPreview(for: .clip(clip))
+    }
+
+    private func findFirstClipItem(in menu: NSMenu) -> NSMenuItem? {
+        for item in menu.items {
+            if item.representedObject is ClipEntry {
+                return item
+            }
+            if let submenu = item.submenu, let child = findFirstClipItem(in: submenu) {
+                return child
+            }
+        }
+        return nil
     }
 
     @MainActor
@@ -360,16 +394,22 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         previewedItemID = nil
         activeMenuOrigin = nil
         previewAnchorPoint = nil
+        rootMenuFrame = .zero
         currentMenuFrame = .zero
+        knownMenuFrames = []
+        previewSide = .right
         isStatusBarMenu = false
         statusBarMainMenuWidth = 0
         statusBarMenuRightEdge = 0
         previewController.hide()
+        highlightedMenu = nil
+        highlightedMenuItem = nil
         anchorWindow.orderOut(nil)
         testPopupStore.dismiss()
     }
 
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        fputs("[DEBUG] menu:willHighlight item=\(item?.title ?? "nil") in menu=\(menu.title)\n", stderr)
         handleHighlightedItem(item, in: menu)
     }
 
@@ -388,13 +428,23 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
     @MainActor
     private func showPreview(for previewItem: ClipPreviewItem) {
+        fputs("[DEBUG] showPreview called for item! anchor=\(previewAnchorPoint ?? .zero) currentMenuFrame=\(currentMenuFrame)\n", stderr)
+        HotkeyService.log.notice("showPreview called for item: \(String(describing: previewItem.persistentModelID), privacy: .public)")
         previewedItemID = previewItem.persistentModelID
+        if !isUITestMode, let menu = highlightedMenu {
+            updateMenuGeometry(for: menu)
+            if let item = highlightedMenuItem {
+                updatePreviewAnchor(for: item, in: menu)
+            }
+        }
         let anchor = previewAnchorPoint ?? NSEvent.mouseLocation
         previewController.show(
             item: previewItem,
             near: anchor,
             menuFrame: currentMenuFrame,
-            parentWindow: isStatusBarMenu ? nil : anchorWindow
+            preferredSide: previewSide,
+            otherMenuFrames: knownMenuFrames,
+            parentWindow: nil
         )
     }
 
@@ -423,7 +473,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     private func scheduleDismissalCheck() {
         dismissTimer?.invalidate()
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self else { return }
                 let mouse = NSEvent.mouseLocation
                 if self.previewController.panelWindow.isVisible {
@@ -523,11 +573,13 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     }
 
     private func showPendingPreview() {
+        fputs("[DEBUG] showPendingPreview called! pendingPreviewItem=\(pendingPreviewItem != nil)\n", stderr)
         guard let item = pendingPreviewItem else { return }
         showPreview(for: item)
     }
 
     private func handleHighlightedItem(_ item: NSMenuItem?, in menu: NSMenu?) {
+        fputs("[DEBUG] handleHighlightedItem item=\(item?.title ?? "nil"), showTooltips=\(self.currentSettings?.showTooltipsInMenu ?? false)\n", stderr)
         guard currentSettings?.showTooltipsInMenu == true else {
             dismissPreview()
             return
@@ -546,49 +598,18 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         } else if let snippet = item?.representedObject as? Snippet {
             previewItem = .snippet(snippet)
         } else {
+            HotkeyService.log.notice("handleHighlightedItem: item has no clip or snippet representedObject. Title=\(item?.title ?? "nil", privacy: .public)")
             dismissPreview()
             return
         }
 
         if let menu, let item {
-            let mouse = NSEvent.mouseLocation
-            if !isUITestMode, let windowFrame = activeMenuWindowFrame(containing: mouse) {
-                currentMenuFrame = windowFrame
-            } else {
-                let menuW = estimatedMenuWidth(for: menu)
-                let menuH = estimatedMenuHeight(for: menu)
-                let screenMaxY = NSScreen.main?.visibleFrame.maxY ?? 900
-
-                if isStatusBarMenu {
-                    if menu.supermenu != nil {
-                        let rightEdge = max(statusBarMenuRightEdge - statusBarMainMenuWidth, menuW)
-                        currentMenuFrame = NSRect(x: rightEdge - menuW, y: screenMaxY - menuH, width: menuW, height: menuH)
-                    } else {
-                        currentMenuFrame = NSRect(x: statusBarMenuRightEdge - statusBarMainMenuWidth, y: screenMaxY - menuH, width: statusBarMainMenuWidth, height: menuH)
-                    }
-                } else {
-                    let origin = activeMenuOrigin ?? mouse
-                    if menu.supermenu != nil {
-                        let rootW = estimatedMenuWidth(for: menu.supermenu!)
-                        currentMenuFrame = NSRect(x: origin.x + rootW, y: origin.y - menuH, width: menuW, height: menuH)
-                    } else {
-                        currentMenuFrame = NSRect(x: origin.x, y: origin.y - menuH, width: menuW, height: menuH)
-                    }
-                }
+            highlightedMenu = menu
+            highlightedMenuItem = item
+            if !isUITestMode {
+                updateMenuGeometry(for: menu)
             }
-
-            let visibleItems = menu.items.filter { !$0.isHidden }
-            let itemIndex = max(visibleItems.firstIndex(of: item) ?? 0, 0)
-            let rowOffset = visibleItems.prefix(itemIndex).reduce(CGFloat(0)) { total, current in
-                total + menuItemHeight(current)
-            } + menuItemHeight(item) / 2
-            let calculatedRowY = currentMenuFrame.maxY - rowOffset
-
-            if NSPointInRect(mouse, currentMenuFrame) {
-                previewAnchorPoint = mouse
-            } else {
-                previewAnchorPoint = NSPoint(x: currentMenuFrame.midX, y: calculatedRowY)
-            }
+            updatePreviewAnchor(for: item, in: menu)
         }
 
         let itemID = previewItem.persistentModelID
@@ -609,7 +630,7 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         let itemID = previewItem.persistentModelID
 
         let timer = Timer(timeInterval: 0.1, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self,
                       self.previewRequestID == requestID,
                       self.pendingPreviewItem?.persistentModelID == itemID
@@ -626,14 +647,34 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         stopHighlightPolling()
 
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak menu] _ in
-            Task { @MainActor [weak self, weak menu] in
-                guard let menu else { return }
-                self?.handleHighlightedItem(menu.highlightedItem, in: menu)
+            MainActor.assumeIsolated {
+                guard let self, let menu else { return }
+                if let (item, subMenu) = self.findHighlightedItemAndMenu(in: menu) {
+                    self.handleHighlightedItem(item, in: subMenu)
+                } else {
+                    fputs("[DEBUG] poll: no highlighted item found in \(menu.title)\n", stderr)
+                    self.handleHighlightedItem(nil, in: menu)
+                }
             }
         }
         highlightPollingTimer = timer
         RunLoop.main.add(timer, forMode: .common)
         RunLoop.main.add(timer, forMode: .eventTracking)
+    }
+
+    private func findHighlightedItemAndMenu(in menu: NSMenu) -> (NSMenuItem, NSMenu)? {
+        if let item = menu.highlightedItem {
+            if let submenu = item.submenu, let child = findHighlightedItemAndMenu(in: submenu) {
+                return child
+            }
+            return (item, menu)
+        }
+        for item in menu.items {
+            if let submenu = item.submenu, let child = findHighlightedItemAndMenu(in: submenu) {
+                return child
+            }
+        }
+        return nil
     }
 
     private func stopHighlightPolling() {
@@ -645,18 +686,124 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         NSEvent.mouseLocation
     }
 
-    private func activeMenuWindowFrame(containing point: NSPoint) -> NSRect? {
-        guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return nil
+    private func updatePreviewAnchor(for item: NSMenuItem, in menu: NSMenu) {
+        let mouse = NSEvent.mouseLocation
+        let visibleItems = menu.items.filter { !$0.isHidden }
+        let itemIndex = max(visibleItems.firstIndex(of: item) ?? 0, 0)
+        let rowOffset = visibleItems.prefix(itemIndex).reduce(CGFloat(0)) { total, current in
+            total + menuItemHeight(current)
+        } + menuItemHeight(item) / 2
+        let calculatedRowY = currentMenuFrame.maxY - rowOffset
+
+        // Follow the mouse only when it is actually over the menu that owns
+        // the highlighted item. Keyboard navigation often leaves the cursor
+        // sitting on the root popup while a submenu is open.
+        if NSPointInRect(mouse, currentMenuFrame) {
+            previewAnchorPoint = mouse
+        } else {
+            previewAnchorPoint = NSPoint(x: currentMenuFrame.midX, y: calculatedRowY)
+        }
+    }
+
+    private func preferredPreviewSide(for menuFrame: NSRect) -> PreviewSide {
+        if isStatusBarMenu { return .left }
+
+        let probe = NSPoint(x: menuFrame.midX, y: menuFrame.midY)
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(probe, $0.frame, false) }) ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? .zero
+        guard visible.width > 0 else { return .right }
+
+        let spaceOnLeft = menuFrame.minX - visible.minX
+        let spaceOnRight = visible.maxX - menuFrame.maxX
+        return spaceOnRight >= spaceOnLeft ? .right : .left
+    }
+
+    private func updateMenuGeometry(for menu: NSMenu) {
+        let windows = visiblePopupMenuFrames()
+        let isSubmenu = menu.supermenu != nil
+
+        if !isSubmenu {
+            if let actual = matchingMenuWindow(
+                expected: rootMenuFrame.width > 0 ? rootMenuFrame : currentMenuFrame,
+                in: windows,
+                preferring: activeMenuOrigin
+            ) {
+                rootMenuFrame = actual
+            } else if windows.count == 1 {
+                rootMenuFrame = windows[0]
+            }
+            currentMenuFrame = rootMenuFrame
+            knownMenuFrames = windows.isEmpty ? [rootMenuFrame] : windows
+            previewSide = preferredPreviewSide(for: rootMenuFrame)
+            return
         }
 
-        let mainScreenHeight = NSScreen.screens.first?.frame.height ?? 900
+        if let actualRoot = matchingMenuWindow(expected: rootMenuFrame, in: windows, preferring: activeMenuOrigin) {
+            rootMenuFrame = actualRoot
+        }
 
+        let expectedSide = preferredPreviewSide(for: rootMenuFrame)
+        let estimatedSubmenu = estimatedSubmenuFrame(for: menu, root: rootMenuFrame, side: expectedSide)
+        let submenuWindows = windows.filter { !isApproximatelySameWindow($0, rootMenuFrame) }
+
+        if let submenu = matchingMenuWindow(expected: estimatedSubmenu, in: submenuWindows, preferring: nil)
+            ?? submenuWindows.max(by: { abs($0.midX - rootMenuFrame.midX) < abs($1.midX - rootMenuFrame.midX) }) {
+            currentMenuFrame = submenu
+            previewSide = submenu.midX < rootMenuFrame.midX ? .left : .right
+        } else {
+            previewSide = expectedSide
+            currentMenuFrame = estimatedSubmenu
+        }
+
+        knownMenuFrames = windows.isEmpty ? [rootMenuFrame, currentMenuFrame] : windows
+    }
+
+    private func estimatedSubmenuFrame(for menu: NSMenu, root: NSRect, side: PreviewSide) -> NSRect {
+        let menuW = estimatedMenuWidth(for: menu)
+        let menuH = estimatedMenuHeight(for: menu)
+        let x = side == .right ? root.maxX : root.minX - menuW
+        return NSRect(x: x, y: root.maxY - menuH, width: menuW, height: menuH)
+    }
+
+    private func isApproximatelySameWindow(_ a: NSRect, _ b: NSRect) -> Bool {
+        if abs(a.midX - b.midX) < 30 && abs(a.minY - b.minY) < 40 {
+            return true
+        }
+        let overlap = a.intersection(b)
+        return overlap.width > min(a.width, b.width) * 0.6
+    }
+
+    private func matchingMenuWindow(expected: NSRect, in windows: [NSRect], preferring point: NSPoint?) -> NSRect? {
+        if let point, let containing = windows.first(where: { NSPointInRect(point, $0) }) {
+            if expected.width <= 0 || abs(containing.midX - expected.midX) < 80 {
+                return containing
+            }
+        }
+
+        guard expected.width > 0, !windows.isEmpty else { return windows.first }
+        return windows.min { a, b in
+            hypot(a.midX - expected.midX, a.midY - expected.midY) < hypot(b.midX - expected.midX, b.midY - expected.midY)
+        }
+    }
+
+    private func visiblePopupMenuFrames() -> [NSRect] {
+        guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let mainScreenHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+            ?? NSScreen.screens.first?.frame.height
+            ?? 900
+        let previewFrame = previewController.panelWindow.isVisible ? previewController.panelWindow.frame : .null
+
+        var frames: [NSRect] = []
         for info in windowList {
-            guard let layer = info[kCGWindowLayer as String] as? Int, (100...110).contains(layer),
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid,
+                  let layer = info[kCGWindowLayer as String] as? Int, (100...110).contains(layer),
                   let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
                   let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
-                  rect.width > 20, rect.height > 20
+                  rect.width > 40, rect.height > 20
             else { continue }
 
             let cocoaRect = NSRect(
@@ -666,12 +813,15 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
                 height: rect.height
             )
 
-            if NSPointInRect(point, cocoaRect) {
-                return cocoaRect
+            if !previewFrame.isNull,
+               cocoaRect.intersects(previewFrame.insetBy(dx: 4, dy: 4)),
+               abs(cocoaRect.width - previewFrame.width) < 40 {
+                continue
             }
-        }
 
-        return nil
+            frames.append(cocoaRect)
+        }
+        return frames
     }
 
     private func estimatedMenuWidth(for menu: NSMenu) -> CGFloat {
@@ -784,6 +934,9 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quit)
 
+        for (idx, item) in menu.items.enumerated() {
+            fputs("[DEBUG MENU ITEM \(idx)] '\(item.title)' isSeparator=\(item.isSeparatorItem) hasSubmenu=\(item.submenu != nil) rep=\(String(describing: type(of: item.representedObject as Any)))\n", stderr)
+        }
         return menu
     }
 
@@ -1315,14 +1468,21 @@ private final class ClipPreviewPanelController {
 
     var panelWindow: NSWindow { panel }
 
-    func show(item: ClipPreviewItem, near point: NSPoint, menuFrame: NSRect = .zero, parentWindow: NSWindow? = nil) {
+    func show(
+        item: ClipPreviewItem,
+        near point: NSPoint,
+        menuFrame: NSRect = .zero,
+        preferredSide: PreviewSide = .right,
+        otherMenuFrames: [NSRect] = [],
+        parentWindow: NSWindow? = nil
+    ) {
         let size = ClipPreviewContentView.preferredSize(for: item)
         hostingController.rootView = AnyView(
             ClipPreviewContentView(item: item, preferredSize: size)
                 .accessibilityIdentifier("clipPreviewContent")
         )
         panel.setContentSize(size)
-        position(near: point, menuFrame: menuFrame)
+        position(near: point, menuFrame: menuFrame, preferredSide: preferredSide, otherMenuFrames: otherMenuFrames)
 
         if self.parentWindow !== parentWindow {
             self.parentWindow?.removeChildWindow(panel)
@@ -1337,6 +1497,7 @@ private final class ClipPreviewPanelController {
         } else {
             panel.orderFrontRegardless()
         }
+        fputs("[DEBUG] ClipPreviewPanelController.show size=\(size) frame=\(panel.frame) isVisible=\(panel.isVisible) level=\(panel.level.rawValue)\n", stderr)
 
         if isUITestMode {
             let (title, hasImage): (String, Bool)
@@ -1370,35 +1531,78 @@ private final class ClipPreviewPanelController {
         }
     }
 
-    private func position(near point: NSPoint, menuFrame: NSRect = .zero) {
+    private func position(
+        near point: NSPoint,
+        menuFrame: NSRect,
+        preferredSide: PreviewSide,
+        otherMenuFrames: [NSRect]
+    ) {
         let size = panel.frame.size
-        let screen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) }) ?? NSScreen.main
-        let frame = screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let probe = menuFrame.width > 0 ? NSPoint(x: menuFrame.midX, y: menuFrame.midY) : point
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) })
+            ?? NSScreen.screens.first(where: { NSMouseInRect(probe, $0.frame, false) })
+            ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let gap: CGFloat = 8
 
-        var origin: NSPoint
-        if menuFrame != .zero && menuFrame.width > 0 && menuFrame.height > 0 {
-            let spaceOnLeft = menuFrame.minX - frame.minX
-            let spaceOnRight = frame.maxX - menuFrame.maxX
-            if spaceOnLeft >= spaceOnRight {
-                origin = NSPoint(x: menuFrame.minX - size.width - 8, y: point.y - (size.height / 2))
-            } else {
-                origin = NSPoint(x: menuFrame.maxX + 8, y: point.y - (size.height / 2))
-            }
+        var y = point.y - (size.height / 2)
+        if y < visible.minY + gap {
+            y = visible.minY + gap
+        }
+        if y + size.height > visible.maxY - gap {
+            y = visible.maxY - size.height - gap
+        }
+
+        let obstacles: [NSRect]
+        if !otherMenuFrames.isEmpty {
+            obstacles = otherMenuFrames
+        } else if menuFrame.width > 0, menuFrame.height > 0 {
+            obstacles = [menuFrame]
         } else {
-            origin = NSPoint(x: point.x + 56, y: point.y - (size.height / 2))
-            if origin.x + size.width > frame.maxX {
-                origin.x = point.x - size.width - 56
+            obstacles = []
+        }
+
+        let clusterSeed = menuFrame.width > 0 ? menuFrame : NSRect(origin: point, size: .zero)
+        let cluster = obstacles.reduce(clusterSeed) { $0.union($1) }
+        let adjacentFrame = menuFrame.width > 0 ? menuFrame : cluster
+
+        func rect(beside frame: NSRect, side: PreviewSide) -> NSRect {
+            let x = side == .left ? frame.minX - size.width - gap : frame.maxX + gap
+            return NSRect(x: x, y: y, width: size.width, height: size.height)
+        }
+
+        func isOnscreen(_ rect: NSRect) -> Bool {
+            rect.minX >= visible.minX + gap - 0.5 && rect.maxX <= visible.maxX - gap + 0.5
+        }
+
+        func overlapsMenus(_ rect: NSRect) -> Bool {
+            guard !obstacles.isEmpty else { return false }
+            let padded = rect.insetBy(dx: -2, dy: -2)
+            return obstacles.contains { $0.intersects(padded) }
+        }
+
+        var chosen = rect(beside: adjacentFrame, side: preferredSide)
+        if !isOnscreen(chosen) || overlapsMenus(chosen) {
+            let outer = rect(beside: cluster, side: preferredSide)
+            if isOnscreen(outer) && !overlapsMenus(outer) {
+                chosen = outer
+            } else {
+                let flipped = rect(beside: cluster, side: preferredSide.flipped)
+                if isOnscreen(flipped) && !overlapsMenus(flipped) {
+                    chosen = flipped
+                } else if isOnscreen(outer) {
+                    chosen = outer
+                } else if isOnscreen(flipped) {
+                    chosen = flipped
+                }
             }
         }
-        
-        origin.x = max(frame.minX + 8, origin.x)
-        origin.x = min(frame.maxX - size.width - 8, origin.x)
 
-        if origin.y < frame.minY + 8 {
-            origin.y = frame.minY + 8
-        }
-        if origin.y + size.height > frame.maxY - 8 {
-            origin.y = frame.maxY - size.height - 8
+        var origin = chosen.origin
+        let clampedX = min(max(origin.x, visible.minX + gap), visible.maxX - size.width - gap)
+        let clampedRect = NSRect(x: clampedX, y: origin.y, width: size.width, height: size.height)
+        if !overlapsMenus(clampedRect) {
+            origin.x = clampedX
         }
 
         panel.setFrameOrigin(origin)

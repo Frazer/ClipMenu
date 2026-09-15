@@ -404,10 +404,10 @@ private struct ClipMenuTestPopupOverlay: View {
                     .position(x: submenuOrigin.x + ClipMenuTestPopupLayout.popupWidth / 2, y: submenuOrigin.y + popupHeight(for: 1) / 2)
             }
 
-            if let previewNode = store.previewNode, let previewLevel = store.previewLevel {
+            if let previewNode = store.previewNode, store.previewLevel != nil {
+                let previewFrame = ClipMenuTestPopupLayout.previewFrame(for: store, in: geometrySize)
                 previewView(node: previewNode)
-                    .position(x: previewOrigin(for: previewLevel).x + previewSize(for: previewNode).width / 2,
-                              y: previewOrigin(for: previewLevel).y + previewSize(for: previewNode).height / 2)
+                    .position(x: previewFrame.midX, y: previewFrame.midY)
                     .accessibilityIdentifier("clipPreviewPanel")
             }
         }
@@ -492,44 +492,11 @@ private struct ClipMenuTestPopupOverlay: View {
     }
 
     private var rootOrigin: CGPoint {
-        switch store.source {
-        case .hotkey:
-            return CGPoint(x: 400, y: 170)
-        case .status:
-            return CGPoint(x: 700, y: 80)
-        }
+        ClipMenuTestPopupLayout.rootOrigin(for: store, in: geometrySize)
     }
 
     private var submenuOrigin: CGPoint {
-        switch store.source {
-        case .hotkey:
-            return CGPoint(
-                x: rootOrigin.x + ClipMenuTestPopupLayout.popupWidth + ClipMenuTestPopupLayout.popupSpacing,
-                y: rootOrigin.y + ClipMenuTestPopupLayout.rowHeight + 8
-            )
-        case .status:
-            return CGPoint(
-                x: rootOrigin.x - ClipMenuTestPopupLayout.popupSpacing - ClipMenuTestPopupLayout.popupWidth,
-                y: rootOrigin.y + ClipMenuTestPopupLayout.rowHeight + 8
-            )
-        }
-    }
-
-    private func previewOrigin(for level: Int) -> CGPoint {
-        switch store.source {
-        case .hotkey:
-            // Production always uses root menu frame for hotkey previews — mirror that here.
-            return CGPoint(
-                x: rootOrigin.x - ClipMenuTestPopupLayout.popupSpacing - 280,
-                y: rootOrigin.y
-            )
-        case .status:
-            let base = level == 0 ? rootOrigin : submenuOrigin
-            return CGPoint(
-                x: base.x - ClipMenuTestPopupLayout.popupSpacing - 280,
-                y: base.y
-            )
-        }
+        ClipMenuTestPopupLayout.submenuPopupFrame(for: store, in: geometrySize).origin
     }
 
     private func popupHeight(for level: Int) -> CGFloat {
@@ -605,7 +572,8 @@ private enum ClipMenuTestPopupLayout {
     static func rootOrigin(for store: ClipMenuTestPopupStore, in size: CGSize) -> CGPoint {
         switch store.source {
         case .hotkey:
-            return CGPoint(x: 400, y: 170)
+            // Leave room for a right-opening submenu plus preview inside the harness canvas.
+            return CGPoint(x: 80, y: 170)
         case .status:
             return CGPoint(x: 700, y: 80)
         }
@@ -667,20 +635,24 @@ private enum ClipMenuTestPopupLayout {
         } else {
             return .zero
         }
-        // For hotkey: production always anchors preview to the root menu frame (currentMenuFrame
-        // is set once at popup open and never updated per-submenu for hotkey). Always go LEFT.
-        let popupFrame: CGRect
+        let popupFrame = previewLevel == 0
+            ? rootPopupFrame(for: store, in: size)
+            : submenuPopupFrame(for: store, in: size)
+        let previewSize = CGSize(width: 280, height: previewHeight(for: node))
+        // Hotkey popups sit on the left of the canvas, so submenus and previews open to the right.
+        // Status-bar popups open to the left, matching production.
+        let previewX: CGFloat
         switch store.source {
         case .hotkey:
-            popupFrame = rootPopupFrame(for: store, in: size)
+            previewX = popupFrame.maxX + popupSpacing
         case .status:
-            popupFrame = previewLevel == 0 ? rootPopupFrame(for: store, in: size) : submenuPopupFrame(for: store, in: size)
+            previewX = popupFrame.minX - popupSpacing - previewSize.width
         }
-        let previewSize = CGSize(width: 280, height: previewHeight(for: node))
-        let previewX = popupFrame.minX - popupSpacing - previewSize.width
+        let rowFrame = selectedRowFrame(for: store, level: previewLevel, in: size)
+        let previewY = rowFrame.isEmpty ? popupFrame.minY : rowFrame.midY - previewSize.height / 2
         return CGRect(
             x: previewX,
-            y: popupFrame.minY,
+            y: previewY,
             width: previewSize.width,
             height: previewSize.height
         )

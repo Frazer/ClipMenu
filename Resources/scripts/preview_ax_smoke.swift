@@ -170,8 +170,8 @@ struct PreviewAXSmokeRunner {
         let previewFrame = try waitForRectLabel(identifier: "previewFrameLabel", in: context.appElement)
         let menuBounds = try waitForRectLabel(identifier: "rootPopupFrameLabel", in: context.appElement)
 
-        // Preview must always be to the left of the root menu for hotkey popups.
-        try assertLeftPreview(
+        // Hotkey popups on the left of the canvas open previews to the right of the root menu.
+        try assertRightPreview(
             previewFrame: previewFrame.frame,
             menuBounds: menuBounds.frame,
             referenceFrame: highlightedItem.frame,
@@ -198,10 +198,10 @@ struct PreviewAXSmokeRunner {
         let rootBounds = try waitForRectLabel(identifier: "rootPopupFrameLabel", in: context.appElement)
         let menuBounds = rootBounds.frame.union(submenuBounds.frame)
 
-        // For hotkey, preview anchors to root menu frame and must be to the left of it.
-        try assertLeftPreview(
+        // Hotkey submenus open to the right; the preview must sit to the right of that submenu.
+        try assertRightPreview(
             previewFrame: previewFrame.frame,
-            menuBounds: rootBounds.frame,
+            menuBounds: submenuBounds.frame,
             referenceFrame: submenuItem.frame,
             scenario: "submenu-preview"
         )
@@ -309,6 +309,31 @@ struct PreviewAXSmokeRunner {
             throw SmokeFailure(description: "\(scenario): preview (maxX=\(previewFrame.maxX)) is too far from menu (minX=\(menuBounds.minX)), gap=\(gap)px > 16px")
         }
 
+        try assertPreviewVerticallyAligned(
+            previewFrame: previewFrame,
+            referenceFrame: referenceFrame,
+            scenario: scenario
+        )
+    }
+
+    private static func assertRightPreview(previewFrame: CGRect, menuBounds: CGRect, referenceFrame: CGRect, scenario: String) throws {
+        if previewFrame.minX < menuBounds.maxX {
+            throw SmokeFailure(description: "\(scenario): preview (minX=\(previewFrame.minX)) is not to the right of menu (maxX=\(menuBounds.maxX))")
+        }
+
+        let gap = previewFrame.minX - menuBounds.maxX
+        if gap > 16 {
+            throw SmokeFailure(description: "\(scenario): preview (minX=\(previewFrame.minX)) is too far from menu (maxX=\(menuBounds.maxX)), gap=\(gap)px > 16px")
+        }
+
+        try assertPreviewVerticallyAligned(
+            previewFrame: previewFrame,
+            referenceFrame: referenceFrame,
+            scenario: scenario
+        )
+    }
+
+    private static func assertPreviewVerticallyAligned(previewFrame: CGRect, referenceFrame: CGRect, scenario: String) throws {
         let vertOffset = abs(previewFrame.midY - referenceFrame.midY)
         if vertOffset > 36 {
             throw SmokeFailure(description: "\(scenario): preview (midY=\(previewFrame.midY)) is not vertically aligned with item row (midY=\(referenceFrame.midY)), offset=\(vertOffset)px > 36px")
