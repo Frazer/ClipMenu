@@ -1157,6 +1157,124 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         fputs("[DEBUG] menu:willHighlight item=\(item?.title ?? "nil") in menu=\(menu.title)\n", stderr)
         actionTarget.clipMenuWillHighlight(menu: menu, item: item)
         handleHighlightedItem(item, in: menu)
+        if let item {
+            ensureTypeSelectedItemIsVisible(item, in: menu)
+        }
+    }
+
+    /// NSMenu type-select (e.g. Q → Quit) can highlight a row that sits just below the
+    /// scrolled viewport. Nudge the open menu so trailing chrome stays on-screen.
+    private func ensureTypeSelectedItemIsVisible(_ item: NSMenuItem, in menu: NSMenu) {
+        guard menu.supermenu == nil else { return }
+        let index = menu.index(of: item)
+        guard index >= 0 else { return }
+
+        let footerTitles: Set<String> = [
+            "Quit ClipMenu",
+            "Preferences…",
+            "Edit Snippets…",
+            "Clear History",
+        ]
+        let isTrailingChrome = footerTitles.contains(item.title) || index >= menu.numberOfItems - 4
+        guard isTrailingChrome else { return }
+
+        updateMenuGeometry(for: menu)
+        let frame = currentMenuFrame
+        guard frame.width > 0, frame.height > 0 else { return }
+
+        let timer = Timer(timeInterval: 0.02, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scrollOpenMenuToRevealTrailingItem(title: item.title, menuFrame: frame, menu: menu, item: item)
+            }
+        }
+        RunLoop.current.add(timer, forMode: .eventTracking)
+        RunLoop.current.add(timer, forMode: .default)
+    }
+
+    private func scrollOpenMenuToRevealTrailingItem(title: String, menuFrame: NSRect, menu: NSMenu, item: NSMenuItem) {
+        // Prefer Accessibility scroll-into-view when it works.
+        if scrollAXMenuItemIntoView(titled: title) {
+            rehighlight(item, in: menu)
+            return
+        }
+
+        // Fallback: line-scroll the menu window toward its bottom, then re-highlight.
+        let mainH = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+            ?? NSScreen.main?.frame.height
+            ?? 900
+        let cgPoint = CGPoint(x: menuFrame.midX, y: mainH - menuFrame.midY)
+        for _ in 0..<10 {
+            guard let event = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .line,
+                wheelCount: 1,
+                wheel1: -20,
+                wheel2: 0,
+                wheel3: 0
+            ) else { continue }
+            event.location = cgPoint
+            event.post(tap: .cghidEventTap)
+        }
+        rehighlight(item, in: menu)
+    }
+
+    private func rehighlight(_ item: NSMenuItem, in menu: NSMenu) {
+        let sel = Selector(("highlightItem:"))
+        if menu.responds(to: sel) {
+            menu.perform(sel, with: item)
+        }
+    }
+
+    @discardableResult
+    private func scrollAXMenuItemIntoView(titled title: String) -> Bool {
+        let app = AXUIElementCreateApplication(ProcessInfo.processInfo.processIdentifier)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else {
+            return false
+        }
+
+        for window in windows {
+            if let element = findAXElement(in: window, role: kAXMenuItemRole as String, title: title)
+                ?? findAXElement(in: window, role: "AXMenuItem", title: title) {
+                let scrollResult = AXUIElementPerformAction(element, "AXScrollToVisible" as CFString)
+                if scrollResult == .success { return true }
+                // Some menu rows expose a parent that accepts scroll-to-visible.
+                var parentRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentRef) == .success,
+                   let parent = parentRef {
+                    let parentEl = parent as! AXUIElement
+                    if AXUIElementPerformAction(parentEl, "AXScrollToVisible" as CFString) == .success {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    private func findAXElement(in root: AXUIElement, role: String, title: String) -> AXUIElement? {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(root, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let rootRole = roleRef as? String, rootRole == role {
+            var titleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(root, kAXTitleAttribute as CFString, &titleRef) == .success,
+               let rootTitle = titleRef as? String, rootTitle == title {
+                return root
+            }
+        }
+
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(root, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            return nil
+        }
+        for child in children {
+            if let match = findAXElement(in: child, role: role, title: title) {
+                return match
+            }
+        }
+        return nil
     }
 
     @MainActor

@@ -130,14 +130,13 @@ struct ClipMenuView: View {
 
     // MARK: - Helpers
 
-    /// Replicates the numbering logic from legacy MenuController (starting at 0 or 1, wrapping at 10).
+    /// Visible list index for menu titles (matches folder range labels).
+    /// Keyboard shortcuts still use `listNumber % 10` in `ClipMenuItem`.
     private func listNumber(for index: Int) -> Int {
         if settings.numberingStartsAtZero {
-            return index % 10
-        } else {
-            let n = index + 1
-            return n > 10 ? n % 10 : n
+            return index
         }
+        return index + 1
     }
 
     private func clearHistory() {
