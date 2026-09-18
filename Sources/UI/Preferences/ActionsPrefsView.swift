@@ -18,6 +18,9 @@ struct ActionsPrefsView: View {
     @State private var selectedNodeID: PersistentIdentifier?
     @State private var selectedCatalogID: String?
     @State private var rightTab: RightTab = .builtin
+    @State private var editingNodeID: PersistentIdentifier?
+    @State private var editingTitle: String = ""
+    @FocusState private var isInlineNameFocused: Bool
 
     private enum RightTab: String, CaseIterable {
         case builtin = "Built-in"
@@ -82,21 +85,6 @@ struct ActionsPrefsView: View {
                 actionCatalogPane
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-
-            HStack(spacing: 8) {
-                Text("Name:")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextField("Action name", text: Binding(
-                    get: { selectedNode?.title ?? "" },
-                    set: { newValue in
-                        guard let selectedNode else { return }
-                        selectedNode.title = newValue
-                        persist()
-                    }
-                ))
-                .disabled(selectedNode == nil)
-            }
         }
         .padding(4)
         .onAppear {
@@ -135,8 +123,7 @@ struct ActionsPrefsView: View {
                         Image(systemName: node.isLeaf ? "bolt.fill" : "folder.fill")
                             .foregroundStyle(node.isLeaf ? .orange : .accentColor)
 
-                        Text(node.title)
-                            .lineLimit(1)
+                        actionTitleLabel(for: node)
 
                         Spacer(minLength: 0)
                     }
@@ -157,6 +144,66 @@ struct ActionsPrefsView: View {
                 return moveNode(source, destinationParent: nil, destinationIndex: sortedRoots.count)
             }
         }
+    }
+
+    @ViewBuilder
+    private func actionTitleLabel(for node: ActionNode) -> some View {
+        if editingNodeID == node.persistentModelID {
+            TextField("Name", text: $editingTitle)
+                .textFieldStyle(.plain)
+                .focused($isInlineNameFocused)
+                .onSubmit { commitInlineRename() }
+                .onExitCommand { cancelInlineRename() }
+                .onChange(of: isInlineNameFocused) { _, focused in
+                    if !focused {
+                        commitInlineRename()
+                    }
+                }
+        } else {
+            Text(node.title)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .help(node.title)
+                .simultaneousGesture(
+                    TapGesture(count: 2).onEnded {
+                        beginInlineRename(node)
+                    }
+                )
+        }
+    }
+
+    private func beginInlineRename(_ node: ActionNode) {
+        selectedNodeID = node.persistentModelID
+        editingNodeID = node.persistentModelID
+        editingTitle = node.title
+        DispatchQueue.main.async {
+            isInlineNameFocused = true
+        }
+    }
+
+    private func commitInlineRename() {
+        guard let editingNodeID,
+              let node = allNodes.first(where: { $0.persistentModelID == editingNodeID })
+        else {
+            cancelInlineRename()
+            return
+        }
+
+        let trimmed = editingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed != node.title {
+            node.title = trimmed
+            persist()
+        }
+
+        self.editingNodeID = nil
+        isInlineNameFocused = false
+    }
+
+    private func cancelInlineRename() {
+        editingNodeID = nil
+        isInlineNameFocused = false
+        editingTitle = ""
     }
 
     private var actionControlsPane: some View {
@@ -217,8 +264,11 @@ struct ActionsPrefsView: View {
                         Image(systemName: node.isLeaf ? "bolt.fill" : "folder.fill")
                             .foregroundStyle(node.isLeaf ? .orange : .accentColor)
                         Text(node.name)
+                            .lineLimit(1)
+                            .help(node.name)
                     }
                     .tag(node.id)
+                    .help(node.name)
                 }
             }
             .listStyle(.sidebar)
@@ -427,6 +477,7 @@ struct ActionsPrefsView: View {
         let newFolder = ActionNode(title: "New Folder", isLeaf: false, sortIndex: 0)
         insert(node: newFolder, into: selectedFolderTarget)
         selectedNodeID = newFolder.persistentModelID
+        beginInlineRename(newFolder)
     }
 
     private var selectedFolderTarget: ActionNode? {
@@ -452,6 +503,10 @@ struct ActionsPrefsView: View {
         guard let selectedNode else { return }
         let parent = selectedNode.parent
         let selectedID = selectedNode.persistentModelID
+
+        if editingNodeID == selectedID {
+            cancelInlineRename()
+        }
 
         modelContext.delete(selectedNode)
         normalizeSiblings(in: parent)
