@@ -153,11 +153,11 @@ private enum PreviewSide {
 // MARK: - Clip / snippet menu filtering
 
 private enum ClipMenuFilter {
-    static func apply(query: String, to rootMenu: NSMenu) {
+    static func apply(query: String, imagesOnly: Bool, to rootMenu: NSMenu) {
         resetVisibility(in: rootMenu)
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return }
-        applyRecursive(to: rootMenu, query: q)
+        guard !q.isEmpty || imagesOnly else { return }
+        applyRecursive(to: rootMenu, query: q, imagesOnly: imagesOnly)
         trimRedundantSeparators(in: rootMenu)
     }
 
@@ -170,16 +170,27 @@ private enum ClipMenuFilter {
         }
     }
 
-    private static func applyRecursive(to menu: NSMenu, query: String) {
+    private static func applyRecursive(to menu: NSMenu, query: String, imagesOnly: Bool) {
         for item in menu.items {
             if let sub = item.submenu {
-                applyRecursive(to: sub, query: query)
+                applyRecursive(to: sub, query: query, imagesOnly: imagesOnly)
                 let anyVisible = sub.items.contains { !$0.isHidden && !$0.isSeparatorItem }
                 item.isHidden = !anyVisible
-            } else if let haystack = item.clipMenuFilterHaystack {
-                item.isHidden = !MenuFilterSubstring.matches(query, in: haystack)
+            } else if item.clipMenuFilterHaystack != nil {
+                item.isHidden = !itemMatches(item, query: query, imagesOnly: imagesOnly)
             }
         }
+    }
+
+    private static func itemMatches(_ item: NSMenuItem, query: String, imagesOnly: Bool) -> Bool {
+        if imagesOnly {
+            guard let clip = item.representedObject as? ClipEntry, clip.imageData != nil else {
+                return false
+            }
+        }
+        if query.isEmpty { return true }
+        guard let haystack = item.clipMenuFilterHaystack else { return !imagesOnly }
+        return MenuFilterSubstring.matches(query, in: haystack)
     }
 
     private static func trimRedundantSeparators(in menu: NSMenu) {
@@ -516,27 +527,49 @@ private final class ClipMenuSearchFieldCell: NSSearchFieldCell {
     }
 }
 
-/// Single menu-row filter control: padded search field.
+/// Single menu-row filter control: search field + images toggle.
 private final class ClipMenuFilterBarView: NSView {
     let searchField: ClipMenuSearchField
+    let imagesButton: NSButton
+    var onImagesFilterToggle: (() -> Void)?
 
     init(width: CGFloat) {
         let height: CGFloat = 36
         searchField = ClipMenuSearchField(frame: .zero)
+        imagesButton = NSButton(frame: .zero)
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
 
-        searchField.placeholderString = "Push / to search"
+        searchField.placeholderString = "Push / to search · Tab images"
         searchField.font = NSFont.menuFont(ofSize: NSFont.systemFontSize)
-        searchField.setAccessibilityLabel("Push / to search")
+        searchField.setAccessibilityLabel("Push / to search, Tab for images only")
         searchField.translatesAutoresizingMaskIntoConstraints = false
 
+        imagesButton.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "Show images only")
+        imagesButton.imagePosition = .imageOnly
+        imagesButton.bezelStyle = .flexiblePush
+        imagesButton.isBordered = true
+        imagesButton.setButtonType(.pushOnPushOff)
+        imagesButton.toolTip = "Show images only (Tab)"
+        imagesButton.setAccessibilityLabel("Show images only")
+        imagesButton.target = self
+        imagesButton.action = #selector(imagesButtonClicked(_:))
+        imagesButton.translatesAutoresizingMaskIntoConstraints = false
+        imagesButton.setContentHuggingPriority(.required, for: .horizontal)
+        imagesButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         addSubview(searchField)
+        addSubview(imagesButton)
 
         NSLayoutConstraint.activate([
             searchField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            searchField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             searchField.centerYAnchor.constraint(equalTo: centerYAnchor),
             searchField.heightAnchor.constraint(equalToConstant: 24),
+
+            imagesButton.leadingAnchor.constraint(equalTo: searchField.trailingAnchor, constant: 6),
+            imagesButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            imagesButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            imagesButton.widthAnchor.constraint(equalToConstant: 28),
+            imagesButton.heightAnchor.constraint(equalToConstant: 24),
         ])
     }
 
@@ -547,6 +580,15 @@ private final class ClipMenuFilterBarView: NSView {
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: 36)
+    }
+
+    func setImagesFilterActive(_ active: Bool) {
+        imagesButton.state = active ? .on : .off
+        imagesButton.contentTintColor = active ? NSColor.controlAccentColor : nil
+    }
+
+    @objc private func imagesButtonClicked(_ sender: NSButton) {
+        onImagesFilterToggle?()
     }
 }
 
@@ -1688,12 +1730,18 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
         return frames
     }
 
-    private func estimatedMenuWidth(for menu: NSMenu) -> CGFloat {
-        let titleWidths = menu.items
-            .filter { !$0.isHidden }
-            .map { ($0.title as NSString).size(withAttributes: [.font: NSFont.menuFont(ofSize: 0)]).width }
-
-        return min(max((titleWidths.max() ?? 220) + 120, 220), 420)
+    /// Prefer attributed titles (image thumbnails) over plain `.title`; optionally
+    /// include hidden rows so a filter toggle does not remasure against a narrower set.
+    private func estimatedMenuWidth(for menu: NSMenu, includingHidden: Bool = false) -> CGFloat {
+        let items = includingHidden ? menu.items : menu.items.filter { !$0.isHidden }
+        let contentWidths: [CGFloat] = items.map { item in
+            if let attributed = item.attributedTitle, attributed.length > 0 {
+                return ceil(attributed.size().width)
+            }
+            return ceil((item.title as NSString).size(withAttributes: [.font: NSFont.menuFont(ofSize: 0)]).width)
+        }
+        // +120 covers menu chrome (icons, padding, key equivalents); room for ~100pt thumbs.
+        return min(max((contentWidths.max() ?? 220) + 120, 280), 520)
     }
 
     private func menuItemHeight(_ item: NSMenuItem) -> CGFloat {
@@ -1807,6 +1855,16 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
 
         if kind != .actions {
             actionTarget.filterRootMenu = menu
+            // Lock width after all items (incl. image thumbnails) exist so toggling
+            // images-only filter does not remasure the popup from a different set of rows.
+            let locked = estimatedMenuWidth(for: menu, includingHidden: true)
+            menu.minimumWidth = locked
+            actionTarget.lockedFilterMenuWidth = locked
+            if let bar = actionTarget.filterImagesButtonHost {
+                bar.frame.size.width = locked
+            }
+        } else {
+            actionTarget.lockedFilterMenuWidth = nil
         }
 
         for (idx, item) in menu.items.enumerated() {
@@ -1816,18 +1874,24 @@ private final class HotkeyPopupMenuPresenter: NSObject, NSMenuDelegate {
     }
 
     private func insertFilterMenuItems(into menu: NSMenu) {
-        let width = max(estimatedMenuWidth(for: menu), 260)
+        // Placeholder width; finalized once history/snippet rows are attached.
+        let width = max(estimatedMenuWidth(for: menu, includingHidden: true), 280)
         let bar = ClipMenuFilterBarView(width: width)
         bar.searchField.delegate = actionTarget
+        bar.onImagesFilterToggle = { [weak actionTarget] in
+            actionTarget?.toggleImagesOnlyFilter()
+        }
+        bar.setImagesFilterActive(actionTarget.isImagesOnlyFilter)
 
         // Single search row. Do NOT set keyEquivalent to "/": AppKit then tries to
         // highlight this view-backed item, fails, and jumps to the first regular row.
         let filterItem = NSMenuItem(title: "Push / to search", action: nil, keyEquivalent: "")
-        filterItem.toolTip = "Push / to search, then type to filter"
+        filterItem.toolTip = "Push / to search, then type to filter. Tab shows images only."
         filterItem.view = bar
 
         actionTarget.filterTitleMenuItem = filterItem
         actionTarget.filterSearchField = bar.searchField
+        actionTarget.filterImagesButtonHost = bar
 
         menu.addItem(filterItem)
         menu.addItem(.separator())
@@ -2658,8 +2722,13 @@ private final class HotkeyPopupActionTarget: NSObject {
     weak var filterRootMenu: NSMenu?
     weak var filterSearchField: ClipMenuSearchField?
     weak var filterTitleMenuItem: NSMenuItem?
+    weak var filterImagesButtonHost: ClipMenuFilterBarView?
+    /// Width locked when the menu is built so filter toggles do not resize the popup.
+    var lockedFilterMenuWidth: CGFloat?
     /// True after `/` until Escape / ↓ / highlight leaves the filter.
     private(set) var isFilterModeActive = false
+    /// When true, only clipboard rows with image data remain visible.
+    private(set) var isImagesOnlyFilter = false
     private var isSuppressingContentHighlight = false
     private let pasteService = PasteService()
     /// Modifiers observed while the popup menu is open (flags can clear before the item action runs).
@@ -2982,7 +3051,8 @@ private final class HotkeyPopupActionTarget: NSObject {
             return true
         case 36, 76: // return / keypad enter — stay in filter, don't activate a row
             return true
-        case 48: // tab
+        case 48: // tab — toggle images-only filter
+            toggleImagesOnlyFilter()
             return true
         default:
             if let chars = characters(from: cgEvent), !chars.isEmpty {
@@ -3010,6 +3080,7 @@ private final class HotkeyPopupActionTarget: NSObject {
         isFilterModeActive = false
         if clearQuery, let field = filterSearchField {
             field.stringValue = ""
+            setImagesOnlyFilter(false)
             applyCurrentFilterQuery()
         }
         filterSearchField?.releaseTypingCaptureForMenuNavigation()
@@ -3017,6 +3088,20 @@ private final class HotkeyPopupActionTarget: NSObject {
             window.makeFirstResponder(nil)
         }
         fputs("[ClipMenu] Filter mode OFF\n", stderr)
+    }
+
+    func toggleImagesOnlyFilter() {
+        setImagesOnlyFilter(!isImagesOnlyFilter)
+        if isImagesOnlyFilter, !isFilterModeActive {
+            enterFilterMode()
+        } else {
+            applyCurrentFilterQuery()
+        }
+    }
+
+    private func setImagesOnlyFilter(_ enabled: Bool) {
+        isImagesOnlyFilter = enabled
+        filterImagesButtonHost?.setImagesFilterActive(enabled)
     }
 
     private func clearMenuHighlight() {
@@ -3064,7 +3149,12 @@ private final class HotkeyPopupActionTarget: NSObject {
         guard let field = filterSearchField else { return }
         let menu = field.enclosingMenuItem?.menu ?? filterRootMenu
         guard let menu else { return }
-        ClipMenuFilter.apply(query: field.stringValue, to: menu)
+        ClipMenuFilter.apply(query: field.stringValue, imagesOnly: isImagesOnlyFilter, to: menu)
+        // Re-assert after visibility changes — AppKit otherwise remasures from visible rows.
+        if let locked = lockedFilterMenuWidth {
+            menu.minimumWidth = locked
+            filterImagesButtonHost?.frame.size.width = locked
+        }
     }
 
     private func isUnmodifiedSlash(keyCode: Int64, shift: Bool, cgEvent: CGEvent) -> Bool {
@@ -3111,12 +3201,15 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     func clipMenuFilterMenuDidClose() {
         isFilterModeActive = false
+        setImagesOnlyFilter(false)
         removeModifierMonitor()
         ClipMenuFilterKeyHook.clearActiveTarget(self)
         filterSearchField?.releaseTypingCaptureForMenuNavigation()
         if let field = filterSearchField {
             field.stringValue = ""
         }
+        filterImagesButtonHost = nil
+        lockedFilterMenuWidth = nil
     }
 
     private func moveFilterFocusToMenuList(field: ClipMenuSearchField) {
@@ -3293,15 +3386,18 @@ extension HotkeyPopupActionTarget: NSSearchFieldDelegate {
         if !isFilterModeActive {
             isFilterModeActive = true
         }
-        let menu = field.enclosingMenuItem?.menu ?? filterRootMenu
-        guard let menu else { return }
-        ClipMenuFilter.apply(query: field.stringValue, to: menu)
+        applyCurrentFilterQuery()
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard let field = filterSearchField, control === field else { return false }
         if commandSelector == #selector(NSResponder.moveDown(_:)) {
             moveFilterFocusToMenuList(field: field)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertTab(_:))
+            || commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+            toggleImagesOnlyFilter()
             return true
         }
         return false
