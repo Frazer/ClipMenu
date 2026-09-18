@@ -15,11 +15,13 @@ struct ActionsPrefsView: View {
            sort: \ActionNode.sortIndex)
     private var rootNodes: [ActionNode]
 
-    @State private var selectedNodeID: PersistentIdentifier?
+    @State private var selectedNodeToken: String?
     @State private var selectedCatalogID: String?
     @State private var rightTab: RightTab = .builtin
     @State private var editingNodeID: PersistentIdentifier?
     @State private var editingTitle: String = ""
+    @State private var expandedFolderTokens: Set<String> = []
+    @State private var expandedCatalogFolderIDs: Set<String> = []
     @FocusState private var isInlineNameFocused: Bool
 
     private enum RightTab: String, CaseIterable {
@@ -88,14 +90,10 @@ struct ActionsPrefsView: View {
         }
         .padding(4)
         .onAppear {
-            if selectedNodeID == nil {
-                selectedNodeID = rootNodes.first?.persistentModelID
-            }
+            ensureTreeSelection()
         }
         .onChange(of: rootNodes.count) { _, _ in
-            if selectedNode == nil {
-                selectedNodeID = rootNodes.first?.persistentModelID
-            }
+            ensureTreeSelection()
         }
     }
 
@@ -107,32 +105,10 @@ struct ActionsPrefsView: View {
                 .font(.subheadline)
                 .fontWeight(.medium)
 
-            List(selection: $selectedNodeID) {
-                OutlineGroup(sortedRoots, children: \.sortedChildrenForUI) { node in
-                    HStack(spacing: 8) {
-                        Toggle("", isOn: Binding(
-                            get: { node.isEnabled },
-                            set: { newValue in
-                                node.isEnabled = newValue
-                                persist()
-                            }
-                        ))
-                        .labelsHidden()
-                        .toggleStyle(.checkbox)
-
-                        Image(systemName: node.isLeaf ? "bolt.fill" : "folder.fill")
-                            .foregroundStyle(node.isLeaf ? .orange : .accentColor)
-
-                        actionTitleLabel(for: node)
-
-                        Spacer(minLength: 0)
-                    }
-                    .tag(node.persistentModelID)
-                    .draggable(nodeToken(node))
-                    .dropDestination(for: String.self) { items, _ in
-                        guard let sourceToken = items.first else { return false }
-                        return handleDrop(sourceToken: sourceToken, onto: node)
-                    }
+            List {
+                ForEach(flattenedTreeRows) { row in
+                    actionFlatRow(row)
+                        .listRowBackground(rowBackground(isSelected: selectedNodeToken == row.token))
                 }
             }
             .listStyle(.sidebar)
@@ -144,6 +120,110 @@ struct ActionsPrefsView: View {
                 return moveNode(source, destinationParent: nil, destinationIndex: sortedRoots.count)
             }
         }
+    }
+
+    private struct TreeRow: Identifiable {
+        var id: String { token }
+        let token: String
+        let node: ActionNode
+        let depth: Int
+        let hasChildren: Bool
+    }
+
+    private var flattenedTreeRows: [TreeRow] {
+        var rows: [TreeRow] = []
+        func walk(_ nodes: [ActionNode], depth: Int) {
+            for node in nodes.sorted(by: { $0.sortIndex < $1.sortIndex }) {
+                let token = nodeToken(node)
+                let children = node.children.sorted { $0.sortIndex < $1.sortIndex }
+                let hasChildren = !node.isLeaf && !children.isEmpty
+                rows.append(TreeRow(token: token, node: node, depth: depth, hasChildren: hasChildren))
+                if hasChildren, expandedFolderTokens.contains(token) {
+                    walk(children, depth: depth + 1)
+                }
+            }
+        }
+        walk(sortedRoots, depth: 0)
+        return rows
+    }
+
+    private func actionFlatRow(_ row: TreeRow) -> some View {
+        let node = row.node
+        return HStack(spacing: 6) {
+            Color.clear.frame(width: CGFloat(row.depth) * 14)
+
+            if row.hasChildren {
+                Image(systemName: expandedFolderTokens.contains(row.token) ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        toggleExpansion(row.token)
+                    }
+            } else {
+                Color.clear.frame(width: 18, height: 18)
+            }
+
+            HStack(spacing: 6) {
+                Toggle("", isOn: Binding(
+                    get: { node.isEnabled },
+                    set: { newValue in
+                        node.isEnabled = newValue
+                        persist()
+                    }
+                ))
+                .labelsHidden()
+                .toggleStyle(.checkbox)
+
+                Image(systemName: node.isLeaf ? "bolt.fill" : "folder.fill")
+                    .foregroundStyle(node.isLeaf ? .orange : .accentColor)
+
+                actionTitleLabel(for: node)
+
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                selectTreeNode(node)
+            }
+        }
+        .draggable(row.token)
+        .dropDestination(for: String.self) { items, _ in
+            guard let sourceToken = items.first else { return false }
+            return handleDrop(sourceToken: sourceToken, onto: node)
+        }
+    }
+
+    private func toggleExpansion(_ token: String) {
+        if expandedFolderTokens.contains(token) {
+            expandedFolderTokens.remove(token)
+        } else {
+            expandedFolderTokens.insert(token)
+        }
+    }
+
+    private func rowBackground(isSelected: Bool) -> Color {
+        isSelected ? Color.accentColor.opacity(0.18) : Color.clear
+    }
+
+    private func selectTreeNode(_ node: ActionNode) {
+        selectedNodeToken = nodeToken(node)
+        if editingNodeID != nil, editingNodeID != node.persistentModelID {
+            commitInlineRename()
+        }
+    }
+
+    private func selectCatalogNode(id: String) {
+        selectedCatalogID = id
+    }
+
+    private func ensureTreeSelection() {
+        if let selectedNodeToken,
+           allNodes.contains(where: { nodeToken($0) == selectedNodeToken }) {
+            return
+        }
+        selectedNodeToken = sortedRoots.first.map(nodeToken)
     }
 
     @ViewBuilder
@@ -174,7 +254,7 @@ struct ActionsPrefsView: View {
     }
 
     private func beginInlineRename(_ node: ActionNode) {
-        selectedNodeID = node.persistentModelID
+        selectTreeNode(node)
         editingNodeID = node.persistentModelID
         editingTitle = node.title
         DispatchQueue.main.async {
@@ -258,20 +338,79 @@ struct ActionsPrefsView: View {
             }
             .pickerStyle(.segmented)
 
-            List(selection: $selectedCatalogID) {
-                OutlineGroup(catalogNodes, children: \.visibleChildren) { node in
-                    HStack(spacing: 8) {
-                        Image(systemName: node.isLeaf ? "bolt.fill" : "folder.fill")
-                            .foregroundStyle(node.isLeaf ? .orange : .accentColor)
-                        Text(node.name)
-                            .lineLimit(1)
-                            .help(node.name)
-                    }
-                    .tag(node.id)
-                    .help(node.name)
+            List {
+                ForEach(flattenedCatalogRows) { row in
+                    catalogFlatRow(row)
+                        .listRowBackground(rowBackground(isSelected: selectedCatalogID == row.id))
                 }
             }
             .listStyle(.sidebar)
+        }
+    }
+
+    private struct CatalogRow: Identifiable {
+        let id: String
+        let node: CatalogNode
+        let depth: Int
+        let hasChildren: Bool
+    }
+
+    private var flattenedCatalogRows: [CatalogRow] {
+        var rows: [CatalogRow] = []
+        func walk(_ nodes: [CatalogNode], depth: Int) {
+            for node in nodes {
+                let children = node.visibleChildren ?? []
+                let hasChildren = !node.isLeaf && !children.isEmpty
+                rows.append(CatalogRow(id: node.id, node: node, depth: depth, hasChildren: hasChildren))
+                if hasChildren, expandedCatalogFolderIDs.contains(node.id) {
+                    walk(children, depth: depth + 1)
+                }
+            }
+        }
+        walk(catalogNodes, depth: 0)
+        return rows
+    }
+
+    private func catalogFlatRow(_ row: CatalogRow) -> some View {
+        let node = row.node
+        return HStack(spacing: 6) {
+            Color.clear.frame(width: CGFloat(row.depth) * 14)
+
+            if row.hasChildren {
+                Image(systemName: expandedCatalogFolderIDs.contains(row.id) ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if expandedCatalogFolderIDs.contains(row.id) {
+                            expandedCatalogFolderIDs.remove(row.id)
+                        } else {
+                            expandedCatalogFolderIDs.insert(row.id)
+                        }
+                    }
+            } else {
+                Color.clear.frame(width: 18, height: 18)
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: node.isLeaf ? "bolt.fill" : "folder.fill")
+                    .foregroundStyle(node.isLeaf ? .orange : .accentColor)
+                Text(node.name)
+                    .lineLimit(1)
+                    .help(node.name)
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+            .help(node.name)
+            .onTapGesture(count: 2) {
+                guard node.isLeaf else { return }
+                selectCatalogNode(id: node.id)
+                addSelectedCatalogAction()
+            }
+            .onTapGesture {
+                selectCatalogNode(id: node.id)
+            }
         }
     }
 
@@ -280,8 +419,8 @@ struct ActionsPrefsView: View {
     }
 
     private var selectedNode: ActionNode? {
-        guard let selectedNodeID else { return nil }
-        return allNodes.first { $0.persistentModelID == selectedNodeID }
+        guard let selectedNodeToken else { return nil }
+        return allNodes.first { nodeToken($0) == selectedNodeToken }
     }
 
     private var allNodes: [ActionNode] {
@@ -470,13 +609,19 @@ struct ActionsPrefsView: View {
         newNode.actionName = item.actionName
         newNode.scriptPath = item.scriptPath
         insert(node: newNode, into: selectedFolderTarget)
-        selectedNodeID = newNode.persistentModelID
+        selectedNodeToken = nodeToken(newNode)
+        if let folder = selectedFolderTarget {
+            expandedFolderTokens.insert(nodeToken(folder))
+        }
     }
 
     private func addFolder() {
         let newFolder = ActionNode(title: "New Folder", isLeaf: false, sortIndex: 0)
         insert(node: newFolder, into: selectedFolderTarget)
-        selectedNodeID = newFolder.persistentModelID
+        selectedNodeToken = nodeToken(newFolder)
+        if let folder = selectedFolderTarget {
+            expandedFolderTokens.insert(nodeToken(folder))
+        }
         beginInlineRename(newFolder)
     }
 
@@ -502,6 +647,7 @@ struct ActionsPrefsView: View {
     private func removeSelectedNode() {
         guard let selectedNode else { return }
         let parent = selectedNode.parent
+        let removedToken = nodeToken(selectedNode)
         let selectedID = selectedNode.persistentModelID
 
         if editingNodeID == selectedID {
@@ -512,11 +658,11 @@ struct ActionsPrefsView: View {
         normalizeSiblings(in: parent)
         persist()
 
-        if selectedNodeID == selectedID {
+        if selectedNodeToken == removedToken {
             if let parent {
-                selectedNodeID = parent.persistentModelID
+                selectedNodeToken = nodeToken(parent)
             } else {
-                selectedNodeID = rootNodes.first?.persistentModelID
+                selectedNodeToken = sortedRoots.first.map(nodeToken)
             }
         }
     }
@@ -672,7 +818,7 @@ struct ActionsPrefsView: View {
             renumber(nodes: roots)
         }
 
-        selectedNodeID = source.persistentModelID
+        selectedNodeToken = nodeToken(source)
         persist()
         return true
     }
@@ -690,13 +836,6 @@ struct ActionsPrefsView: View {
             current = node.parent
         }
         return false
-    }
-}
-
-private extension ActionNode {
-    var sortedChildrenForUI: [ActionNode]? {
-        let sorted = children.sorted { $0.sortIndex < $1.sortIndex }
-        return sorted.isEmpty ? nil : sorted
     }
 }
 
