@@ -23,6 +23,16 @@ struct ActionsPrefsView: View {
     @State private var expandedFolderTokens: Set<String> = []
     @State private var expandedCatalogFolderIDs: Set<String> = []
     @FocusState private var isInlineNameFocused: Bool
+    /// Bumped when user scripts on disk change so the User's catalog reloads.
+    @State private var catalogEpoch = 0
+
+    @State private var scriptTitle = ""
+    @State private var scriptBody = ""
+    @State private var scriptFileURL: URL?
+    @State private var scriptIsEditable = false
+    @State private var scriptHasChanges = false
+    @State private var scriptPlaceholder: String? = "Select a JavaScript action to view or edit its source."
+    @State private var scriptError: String?
 
     private enum RightTab: String, CaseIterable {
         case builtin = "Built-in"
@@ -86,14 +96,24 @@ struct ActionsPrefsView: View {
                     .frame(width: 120)
                 actionCatalogPane
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity, alignment: .top)
+
+            scriptEditorPane
+                .frame(maxWidth: .infinity, minHeight: 180, idealHeight: 220)
         }
         .padding(4)
         .onAppear {
             ensureTreeSelection()
+            try? UserActionScriptsStore.ensureDirectory()
         }
         .onChange(of: rootNodes.count) { _, _ in
             ensureTreeSelection()
+        }
+        .onChange(of: rightTab) { _, tab in
+            if tab == .users {
+                try? UserActionScriptsStore.ensureDirectory()
+                catalogEpoch += 1
+            }
         }
     }
 
@@ -212,10 +232,181 @@ struct ActionsPrefsView: View {
         if editingNodeID != nil, editingNodeID != node.persistentModelID {
             commitInlineRename()
         }
+        presentScript(forActionNode: node)
     }
 
     private func selectCatalogNode(id: String) {
         selectedCatalogID = id
+        if let item = catalogLeafItemsByID[id] {
+            presentScript(forCatalogItem: item)
+        } else {
+            clearScriptEditor(placeholder: "Select a JavaScript action to view or edit its source.")
+        }
+    }
+
+    private func presentScript(forCatalogItem item: AvailableActionItem) {
+        guard item.actionType == "javaScript", let path = item.scriptPath else {
+            clearScriptEditor(
+                placeholder: item.actionType == "builtin"
+                    ? "Built-in actions are implemented in Swift and have no JavaScript source."
+                    : "Select a JavaScript action to view or edit its source."
+            )
+            return
+        }
+        presentScript(title: item.name, path: path)
+    }
+
+    private func presentScript(forActionNode node: ActionNode) {
+        if let inline = node.scriptContent, !inline.isEmpty {
+            scriptTitle = node.title
+            scriptBody = inline
+            scriptFileURL = nil
+            scriptIsEditable = true
+            scriptHasChanges = false
+            scriptPlaceholder = nil
+            scriptError = nil
+            return
+        }
+        guard node.actionType == "javaScript", let path = node.scriptPath else {
+            clearScriptEditor(placeholder: "Select a JavaScript action to view or edit its source.")
+            return
+        }
+        presentScript(title: node.title, path: path)
+    }
+
+    private func presentScript(title: String, path: String) {
+        let url = URL(fileURLWithPath: path)
+        guard let contents = UserActionScriptsStore.load(at: url) else {
+            clearScriptEditor(placeholder: "Could not read script at \(path)")
+            return
+        }
+        scriptTitle = title
+        scriptBody = contents
+        scriptFileURL = url
+        scriptIsEditable = UserActionScriptsStore.isUserScript(at: path)
+        scriptHasChanges = false
+        scriptPlaceholder = nil
+        scriptError = nil
+    }
+
+    private func clearScriptEditor(placeholder: String) {
+        scriptTitle = ""
+        scriptBody = ""
+        scriptFileURL = nil
+        scriptIsEditable = false
+        scriptHasChanges = false
+        scriptPlaceholder = placeholder
+        scriptError = nil
+    }
+
+    private func createNewUserScript() {
+        do {
+            let url = try UserActionScriptsStore.saveNewScript(
+                preferredTitle: "Untitled Action",
+                content: UserActionScriptsStore.defaultTemplate
+            )
+            rightTab = .users
+            catalogEpoch += 1
+            expandedCatalogFolderIDs = []
+            selectedCatalogID = "script:\(url.path)"
+            presentScript(title: UserActionScriptsStore.title(fromScriptURL: url), path: url.path)
+            scriptHasChanges = false
+        } catch {
+            scriptError = error.localizedDescription
+        }
+    }
+
+    private func duplicateCurrentAsUserTemplate() {
+        let title = scriptTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preferred = title.isEmpty ? "Custom Action" : title
+        do {
+            let url = try UserActionScriptsStore.saveNewScript(
+                preferredTitle: preferred,
+                content: scriptBody
+            )
+            rightTab = .users
+            catalogEpoch += 1
+            selectedCatalogID = "script:\(url.path)"
+            presentScript(title: UserActionScriptsStore.title(fromScriptURL: url), path: url.path)
+        } catch {
+            scriptError = error.localizedDescription
+        }
+    }
+
+    private func saveCurrentScript() {
+        guard scriptIsEditable else { return }
+        let trimmedTitle = scriptTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else {
+            scriptError = "Give the script a name before saving."
+            return
+        }
+
+        do {
+            try UserActionScriptsStore.ensureDirectory()
+            let destination: URL
+            if let existing = scriptFileURL, UserActionScriptsStore.isUserScript(at: existing.path) {
+                let renamed = try UserActionScriptsStore.rename(at: existing, toPreferredTitle: trimmedTitle)
+                try UserActionScriptsStore.save(at: renamed, content: scriptBody)
+                updateActionNodesScriptPath(from: existing, to: renamed, title: trimmedTitle)
+                destination = renamed
+            } else {
+                destination = try UserActionScriptsStore.saveNewScript(
+                    preferredTitle: trimmedTitle,
+                    content: scriptBody
+                )
+            }
+            catalogEpoch += 1
+            selectedCatalogID = "script:\(destination.path)"
+            presentScript(title: UserActionScriptsStore.title(fromScriptURL: destination), path: destination.path)
+            scriptError = nil
+        } catch {
+            scriptError = error.localizedDescription
+        }
+    }
+
+    private func deleteCurrentUserScript() {
+        guard let url = scriptFileURL, UserActionScriptsStore.isUserScript(at: url.path) else { return }
+        do {
+            try UserActionScriptsStore.delete(at: url)
+            removeActionNodes(referencingScriptPath: url.path)
+            catalogEpoch += 1
+            selectedCatalogID = nil
+            clearScriptEditor(placeholder: "Script deleted. Select another action or create a new script.")
+        } catch {
+            scriptError = error.localizedDescription
+        }
+    }
+
+    private func revealUserScriptsFolder() {
+        do {
+            try UserActionScriptsStore.revealInFinder()
+        } catch {
+            scriptError = error.localizedDescription
+        }
+    }
+
+    private func updateActionNodesScriptPath(from oldURL: URL, to newURL: URL, title: String) {
+        let oldPath = oldURL.path
+        for node in allNodes where node.scriptPath == oldPath {
+            node.scriptPath = newURL.path
+            if node.title == UserActionScriptsStore.title(fromScriptURL: oldURL) {
+                node.title = title
+            }
+        }
+        persist()
+    }
+
+    private func removeActionNodes(referencingScriptPath path: String) {
+        let victims = allNodes.filter { $0.scriptPath == path }
+        for node in victims {
+            let parent = node.parent
+            modelContext.delete(node)
+            normalizeSiblings(in: parent)
+        }
+        if !victims.isEmpty {
+            persist()
+            ensureTreeSelection()
+        }
     }
 
     private func ensureTreeSelection() {
@@ -338,14 +529,158 @@ struct ActionsPrefsView: View {
             }
             .pickerStyle(.segmented)
 
-            List {
-                ForEach(flattenedCatalogRows) { row in
-                    catalogFlatRow(row)
-                        .listRowBackground(rowBackground(isSelected: selectedCatalogID == row.id))
+            if rightTab == .users, flattenedCatalogRows.isEmpty {
+                VStack(spacing: 10) {
+                    ContentUnavailableView(
+                        "No user scripts",
+                        systemImage: "doc.badge.plus",
+                        description: Text("Create one here, or open the JavaScript tab, select an action, and choose Copy to User’s.")
+                    )
+                    HStack(spacing: 8) {
+                        Button("New Script") { createNewUserScript() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        compactIconButton(
+                            systemImage: "folder",
+                            help: "Reveal scripts folder",
+                            action: revealUserScriptsFolder
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(flattenedCatalogRows) { row in
+                        catalogFlatRow(row)
+                            .listRowBackground(rowBackground(isSelected: selectedCatalogID == row.id))
+                    }
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+
+    private var scriptEditorPane: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Script")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                if scriptPlaceholder == nil {
+                    TextField("Script name", text: $scriptTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 220)
+                        .disabled(!scriptIsEditable)
+                        .onChange(of: scriptTitle) { _, _ in
+                            if scriptIsEditable { scriptHasChanges = true }
+                        }
+
+                    if scriptIsEditable {
+                        Text(scriptHasChanges ? "Edited" : "Saved")
+                            .font(.caption)
+                            .foregroundStyle(scriptHasChanges ? .orange : .secondary)
+                    } else {
+                        Text("Read-only · bundled")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                if canDuplicateAsTemplate {
+                    Button("Copy to User’s") { duplicateCurrentAsUserTemplate() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .help("Create an editable copy under the User’s tab")
+                }
+
+                if scriptIsEditable {
+                    Button("Save") { saveCurrentScript() }
+                        .controlSize(.small)
+                        .disabled(!scriptHasChanges || scriptBody.isEmpty)
+                        .keyboardShortcut("s", modifiers: .command)
+
+                    Button("New") { createNewUserScript() }
+                        .controlSize(.small)
+
+                    compactIconButton(
+                        systemImage: "trash",
+                        help: "Delete script",
+                        role: .destructive,
+                        disabled: scriptFileURL == nil,
+                        action: deleteCurrentUserScript
+                    )
+
+                    compactIconButton(
+                        systemImage: "folder",
+                        help: "Reveal scripts folder",
+                        action: revealUserScriptsFolder
+                    )
+                } else if rightTab == .users {
+                    Button("New") { createNewUserScript() }
+                        .controlSize(.small)
+
+                    compactIconButton(
+                        systemImage: "folder",
+                        help: "Reveal scripts folder",
+                        action: revealUserScriptsFolder
+                    )
                 }
             }
-            .listStyle(.sidebar)
+
+            if let scriptError {
+                Text(scriptError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if let scriptPlaceholder {
+                Text(scriptPlaceholder)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(8)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                TextEditor(text: Binding(
+                    get: { scriptBody },
+                    set: { newValue in
+                        guard scriptIsEditable else { return }
+                        scriptBody = newValue
+                        scriptHasChanges = true
+                    }
+                ))
+                    .font(.system(.body, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    .opacity(scriptIsEditable ? 1 : 0.92)
+            }
         }
+    }
+
+    private var canDuplicateAsTemplate: Bool {
+        guard scriptPlaceholder == nil, let url = scriptFileURL else { return false }
+        return !UserActionScriptsStore.isUserScript(at: url.path)
+    }
+
+    private func compactIconButton(
+        systemImage: String,
+        help: String,
+        role: ButtonRole? = nil,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 18, height: 14)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.mini)
+        .help(help)
+        .disabled(disabled)
     }
 
     private struct CatalogRow: Identifiable {
@@ -451,6 +786,7 @@ struct ActionsPrefsView: View {
     }
 
     private var catalogNodes: [CatalogNode] {
+        _ = catalogEpoch
         switch rightTab {
         case .builtin:
             return [
@@ -487,11 +823,7 @@ struct ActionsPrefsView: View {
             let bundleURL = Bundle.main.resourceURL?.appendingPathComponent("scripts/action")
             return scriptCatalogNodes(in: bundleURL)
         case .users:
-            let userURL = FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-                .first?
-                .appendingPathComponent("ClipMenu/script/action")
-            return scriptCatalogNodes(in: userURL)
+            return scriptCatalogNodes(in: UserActionScriptsStore.directory)
         }
     }
 

@@ -90,7 +90,7 @@ struct PreferencesView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(minWidth: 680, minHeight: 500)
+        .frame(minWidth: 720, minHeight: 620)
         .padding(12)
     }
 }
