@@ -34,22 +34,20 @@ struct ClipMenuView: View {
             SnippetSection(folders: folders.filter(\.isEnabled))
         }
 
-        if settings.enableAction {
-            Divider()
-            Menu {
-                if let targetClip = clips.first {
-                    let enabledRoots = rootActions.filter(\.isEnabled)
-                    if enabledRoots.isEmpty {
-                        Text("No actions configured")
-                    } else {
-                        ActionSection(nodes: enabledRoots, target: targetClip)
-                    }
+        Divider()
+        Menu {
+            if let targetClip = clips.first {
+                let enabledRoots = rootActions.filter(\.isEnabled)
+                if enabledRoots.isEmpty {
+                    Text("No actions configured")
                 } else {
-                    Text("No clips available")
+                    ActionSection(nodes: enabledRoots, target: targetClip)
                 }
-            } label: {
-                Label("Actions", systemImage: "bolt")
+            } else {
+                Text("No clips available")
             }
+        } label: {
+            Label("Actions", systemImage: "bolt")
         }
 
         // Clear History

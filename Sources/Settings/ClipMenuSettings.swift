@@ -88,9 +88,10 @@ final class ClipMenuSettings {
     // MARK: - Actions
 
     var enableAction: Bool = true { didSet { defaults.set(enableAction, forKey: "enableAction") } }
-    var actionModifierKey: Int = 0 { didSet { defaults.set(actionModifierKey, forKey: "actionModifierKey") } } // 0=Option, 1=Command, 2=Control, 3=Shift
+    /// 0=Option, 1=Command, 2=Control, 3=Shift. Default Command.
+    var actionModifierKey: Int = 1 { didSet { defaults.set(actionModifierKey, forKey: "actionModifierKey") } }
     var invokeActionImmediately: Bool = false { didSet { defaults.set(invokeActionImmediately, forKey: "invokeActionImmediately") } }
-    var controlClickBehavior: String = "popUpActionMenu" { didSet { defaults.set(controlClickBehavior, forKey: "controlClickBehavior") } }
+    var controlClickBehavior: String = "" { didSet { defaults.set(controlClickBehavior, forKey: "controlClickBehavior") } }
     var shiftClickBehavior: String = "" { didSet { defaults.set(shiftClickBehavior, forKey: "shiftClickBehavior") } }
     var optionClickBehavior: String = "" { didSet { defaults.set(optionClickBehavior, forKey: "optionClickBehavior") } }
     var commandClickBehavior: String = "" { didSet { defaults.set(commandClickBehavior, forKey: "commandClickBehavior") } }
@@ -176,9 +177,9 @@ final class ClipMenuSettings {
         hotKeys = defaults.dictionary(forKey: "hotKeys") ?? Self.defaultHotKeys
 
         enableAction = boolValue("enableAction", default: true)
-        actionModifierKey = intValue("actionModifierKey", default: 0)
+        actionModifierKey = intValue("actionModifierKey", default: 1)
         invokeActionImmediately = boolValue("invokeActionImmediately", default: false)
-        controlClickBehavior = stringValue("controlClickBehavior", default: "popUpActionMenu")
+        controlClickBehavior = stringValue("controlClickBehavior", default: "")
         shiftClickBehavior = stringValue("shiftClickBehavior", default: "")
         optionClickBehavior = stringValue("optionClickBehavior", default: "")
         commandClickBehavior = stringValue("commandClickBehavior", default: "")
@@ -203,8 +204,15 @@ final class ClipMenuSettings {
         menuIconSize = [16, 32, 48].contains(menuIconSize) ? menuIconSize : 16
         fontSizeMode = [0, 1].contains(fontSizeMode) ? fontSizeMode : 0
         positionOfSnippets = [0, 1, 2].contains(positionOfSnippets) ? positionOfSnippets : 1
+        actionModifierKey = [0, 1, 2, 3].contains(actionModifierKey) ? actionModifierKey : 1
 
-        if controlClickBehavior.isEmpty { controlClickBehavior = "popUpActionMenu" }
+        // Prefer Command as the default action modifier when upgrading from the old Option default.
+        if defaults.object(forKey: "actionModifierKeyMigratedToCommand") == nil {
+            if defaults.object(forKey: "actionModifierKey") == nil || actionModifierKey == 0 {
+                actionModifierKey = 1
+            }
+            defaults.set(true, forKey: "actionModifierKeyMigratedToCommand")
+        }
     }
 
     private func registerLegacyDefaultsIfNeeded() {
@@ -257,9 +265,9 @@ final class ClipMenuSettings {
             "menuIconOfFileTypeTagForPICT": 0,
             "menuIconOfFileTypeForPICT": "pict",
             "enableAction": true,
-            "actionModifierKey": 0,
+            "actionModifierKey": 1,
             "invokeActionImmediately": false,
-            "controlClickBehavior": "popUpActionMenu",
+            "controlClickBehavior": "",
             "shiftClickBehavior": "",
             "optionClickBehavior": "",
             "commandClickBehavior": "",

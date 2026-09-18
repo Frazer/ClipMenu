@@ -41,9 +41,15 @@ enum ActionMenuBuilder {
             let item = NSMenuItem(title: node.title, action: #selector(ActionMenuTarget.handleMenuItemAction(_:)), keyEquivalent: "")
             item.target = ActionMenuTarget.shared
             item.representedObject = ActionMenuInvocation {
-                Task {
-                    await service.perform(action: node, on: target, executionContext: executionContext)
-                    if let postAction {
+                Task { @MainActor in
+                    let didApply = await service.perform(
+                        action: node,
+                        on: target,
+                        executionContext: executionContext
+                    )
+                    // Only Cmd+V after a successful transform — otherwise we'd
+                    // re-paste whatever was already on the pasteboard.
+                    if didApply, let postAction {
                         await postAction()
                     }
                 }

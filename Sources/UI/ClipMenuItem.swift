@@ -188,40 +188,21 @@ struct ClipMenuItem: View {
     // MARK: - Action
 
     private func select() {
-        let flags = NSEvent.modifierFlags.intersection([.control, .shift, .option, .command])
-
-        guard settings.enableAction else {
-            Task { await clipsService.select(entry) }
+        if NSEvent.modifierFlags.intersection([.control, .shift, .option, .command])
+            .contains(actionModifierMask(for: settings.actionModifierKey)) {
+            showActionMenu()
             return
-        }
-
-        if let behavior = behaviorForFlags(flags), !behavior.isEmpty {
-            if behavior == "popUpActionMenu" {
-                showActionMenu()
-                return
-            }
-
-            if let configuredNode = configuredActionNode(from: behavior) {
-                Task { await actionService.perform(action: configuredNode, on: entry, executionContext: .pasteContext) }
-                return
-            }
         }
 
         Task { await clipsService.select(entry) }
     }
 
-    private func behaviorForFlags(_ flags: NSEvent.ModifierFlags) -> String? {
-        switch flags {
-        case .control:
-            return settings.controlClickBehavior
-        case .shift:
-            return settings.shiftClickBehavior
-        case .option:
-            return settings.optionClickBehavior
-        case .command:
-            return settings.commandClickBehavior
-        default:
-            return nil
+    private func actionModifierMask(for key: Int) -> NSEvent.ModifierFlags {
+        switch key {
+        case 1: return .command
+        case 2: return .control
+        case 3: return .shift
+        default: return .option
         }
     }
 
@@ -230,8 +211,7 @@ struct ClipMenuItem: View {
             let roots = await actionService.rootActions()
             let enabledRoots = roots.filter(\.isEnabled)
 
-            if settings.invokeActionImmediately,
-               enabledRoots.count == 1,
+            if enabledRoots.count == 1,
                let only = enabledRoots.first,
                only.isLeaf {
                 await actionService.perform(action: only, on: entry, executionContext: .pasteContext)
@@ -250,32 +230,6 @@ struct ClipMenuItem: View {
                 }
             }
         }
-    }
-
-    private func configuredActionNode(from rawBehavior: String) -> ActionNode? {
-        guard let data = rawBehavior.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let dict = object as? [String: Any] else {
-            return nil
-        }
-
-        let type = (dict["type"] as? String) ?? ""
-        let node = ActionNode(title: (dict["name"] as? String) ?? "Configured Action", isLeaf: true)
-
-        if type == "javaScript" || type == "js" {
-            node.actionType = "javaScript"
-            node.scriptPath = dict["path"] as? String
-            node.scriptContent = dict["content"] as? String
-            return node
-        }
-
-        if type == "builtin" {
-            node.actionType = "builtin"
-            node.actionName = dict["name"] as? String
-            return node
-        }
-
-        return nil
     }
 
     // MARK: - Helpers

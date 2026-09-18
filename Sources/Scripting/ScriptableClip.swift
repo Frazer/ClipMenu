@@ -14,13 +14,21 @@ import AppKit
 
 @objc final class ScriptableClip: NSObject, ScriptableClipExports {
 
-    private let entry: ClipEntry
+    private let entry: ClipEntry?
+    private let textOverride: String?
 
     init(entry: ClipEntry) {
         self.entry = entry
+        self.textOverride = nil
     }
 
-    var text: String? { entry.stringValue }
+    /// Plain-text bridge for action execution off the SwiftData context.
+    init(text: String?) {
+        self.entry = nil
+        self.textOverride = text
+    }
+
+    var text: String? { textOverride ?? entry?.stringValue }
 
     func setStringAttributes(_ attrs: [String: Any]) {
         applyAttributes(attrs, mode: .set)
@@ -35,7 +43,7 @@ import AppKit
     private enum AttributeMode { case set, add }
 
     private func applyAttributes(_ attrs: [String: Any], mode: AttributeMode) {
-        guard entry.stringValue != nil, let rtfData = entry.rtfData else { return }
+        guard let entry, entry.stringValue != nil, let rtfData = entry.rtfData else { return }
 
         let attrString: NSMutableAttributedString
         if entry.isRTFD {

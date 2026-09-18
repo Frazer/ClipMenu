@@ -19,6 +19,10 @@ This repository now reflects a fully modernized implementation of ClipMenu. Majo
 - Completed end-to-end implementation of the Actions menu, including action execution wiring in the modern app.
 - Rebuilt the app architecture in Swift with SwiftUI scenes and a generated Xcode project workflow.
 
+### Actions shortcut
+
+In **Preferences → Actions**, choose a modifier key (default **Command**). Hold that key while selecting a clip or snippet to open the action menu. If only one action is available, it runs immediately instead of showing the menu.
+
 ## Huge Thanks
 
 A huge thank you to Naotaka Morimoto, the original author of ClipMenu.

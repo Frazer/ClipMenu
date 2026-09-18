@@ -48,7 +48,7 @@ actor PasteService {
             Self.log.error("Paste aborted: Accessibility permission not granted")
             return
         }
-        guard let keyCode = vKeyCode() else {
+        guard let keyCode = await resolvedVKeyCode() else {
             Self.log.error("Paste aborted: could not resolve V key code")
             return
         }
@@ -99,22 +99,29 @@ actor PasteService {
         cachedVKeyCode = nil
     }
 
-    private func vKeyCode() -> CGKeyCode? {
+    /// HIToolbox input-source APIs must run on the main thread.
+    private func resolvedVKeyCode() async -> CGKeyCode? {
         if let cachedVKeyCode {
             return cachedVKeyCode
         }
+        let code = await MainActor.run {
+            Self.lookupVKeyCodeFromCurrentLayout()
+        }
+        cachedVKeyCode = code
+        return code
+    }
 
+    @MainActor
+    private static func lookupVKeyCodeFromCurrentLayout() -> CGKeyCode {
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let layoutData = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
         else {
-            cachedVKeyCode = 9
-            return cachedVKeyCode
+            return 9
         }
 
         let layout = unsafeBitCast(layoutData, to: CFData.self)
         guard let bytes = CFDataGetBytePtr(layout) else {
-            cachedVKeyCode = 9
-            return cachedVKeyCode
+            return 9
         }
 
         let keyboardLayout = UnsafePointer<UCKeyboardLayout>(OpaquePointer(bytes))
@@ -140,12 +147,10 @@ actor PasteService {
             guard status == noErr, length > 0 else { continue }
             let mapped = String(utf16CodeUnits: chars, count: Int(length))
             if mapped.caseInsensitiveCompare("v") == .orderedSame {
-                cachedVKeyCode = CGKeyCode(keyCode)
-                return cachedVKeyCode
+                return CGKeyCode(keyCode)
             }
         }
 
-        cachedVKeyCode = 9
-        return cachedVKeyCode
+        return 9
     }
 }

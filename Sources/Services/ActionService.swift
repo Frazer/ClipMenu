@@ -55,61 +55,121 @@ actor ActionService {
     /// Dispatches an action node against a clip entry.
     /// The action result is inserted as a new top clipboard item and copied to
     /// pasteboard. Paste synthesis happens only in paste context.
-    func perform(action node: ActionNode, on entry: ClipEntry, executionContext: ActionExecutionContext = .pasteContext) async {
-        guard node.isEnabled else { return }
+    /// - Returns: `true` when the pasteboard was updated (or a remove completed).
+    @discardableResult
+    func perform(action node: ActionNode, on entry: ClipEntry, executionContext: ActionExecutionContext = .pasteContext) async -> Bool {
+        // SwiftData models must be read on the main actor; reading `actionType` /
+        // `stringValue` from this actor often yields nil and the action no-ops —
+        // after which callers Cmd+V the previous pasteboard contents.
+        let prepared = await MainActor.run { () -> PreparedAction? in
+            guard node.isEnabled else { return nil }
+            let script: String?
+            if let inline = node.scriptContent, !inline.isEmpty {
+                script = inline
+            } else if let path = node.scriptPath {
+                script = try? String(contentsOfFile: path, encoding: .utf8)
+            } else {
+                script = nil
+            }
+            return PreparedAction(
+                actionType: node.actionType,
+                actionName: node.actionName,
+                script: script,
+                stringValue: entry.stringValue,
+                filenames: entry.filenames,
+                urlStrings: entry.urlStrings,
+                rtfData: entry.rtfData,
+                isRTFD: entry.isRTFD,
+                pdfData: entry.pdfData,
+                imageData: entry.imageData,
+                types: entry.types
+            )
+        }
+        guard let prepared else { return false }
 
-        switch node.actionType {
-
+        switch prepared.actionType {
         case "javaScript":
-            guard let script = scriptSource(for: node) else { return }
-            let scriptableClip = ScriptableClip(entry: entry)
-            guard let resultText = engine.run(script: script, clip: scriptableClip) else { return }
-            await replaceClipWithString(resultText, for: entry, shouldPaste: executionContext.shouldPaste)
+            guard let script = prepared.script else { return false }
+            let resultText = engine.run(script: script, clip: ScriptableClip(text: prepared.stringValue))
+            guard let resultText else { return false }
+            await replaceClipWithString(resultText, shouldPaste: executionContext.shouldPaste)
+            return true
 
         case "builtin":
-            await performBuiltin(name: node.actionName ?? "", on: entry, executionContext: executionContext)
+            return await performBuiltin(
+                name: prepared.actionName ?? "",
+                prepared: prepared,
+                originalEntry: entry,
+                executionContext: executionContext
+            )
 
         default:
-            break
+            return false
         }
     }
 
     // MARK: - Built-in actions
     // Keep in sync with legacy/Source/BuiltInActionController.m
 
-    private func performBuiltin(name: String, on entry: ClipEntry, executionContext: ActionExecutionContext) async {
+    private struct PreparedAction: Sendable {
+        var actionType: String?
+        var actionName: String?
+        var script: String?
+        var stringValue: String?
+        var filenames: [String]?
+        var urlStrings: [String]?
+        var rtfData: Data?
+        var isRTFD: Bool
+        var pdfData: Data?
+        var imageData: Data?
+        var types: [String]
+    }
+
+    private func performBuiltin(
+        name: String,
+        prepared: PreparedAction,
+        originalEntry: ClipEntry,
+        executionContext: ActionExecutionContext
+    ) async -> Bool {
         switch name {
         case "removeAction":
-            guard let context else { return }
-            await MainActor.run {
-                context.delete(entry)
+            guard let context else { return false }
+            let removed = await MainActor.run { () -> Bool in
+                // Only delete persisted history clips, never transient snapshots.
+                guard originalEntry.modelContext != nil else { return false }
+                context.delete(originalEntry)
                 try? context.save()
+                return true
             }
+            return removed
 
         case "pasteAsPlainText":
-            guard let text = entry.stringValue else { return }
-            await replaceClipWithString(text, for: entry, shouldPaste: executionContext.shouldPaste)
+            guard let text = prepared.stringValue else { return false }
+            await replaceClipWithString(text, shouldPaste: executionContext.shouldPaste)
+            return true
 
         case "pasteAsFilePath":
-            guard let files = entry.filenames, !files.isEmpty else { return }
+            guard let files = prepared.filenames, !files.isEmpty else { return false }
             let text = files.joined(separator: "\n")
-            await replaceClipWithString(text, for: entry, shouldPaste: executionContext.shouldPaste)
+            await replaceClipWithString(text, shouldPaste: executionContext.shouldPaste)
+            return true
 
         case "pasteAsHFSFilePath":
-            guard let files = entry.filenames, !files.isEmpty else { return }
+            guard let files = prepared.filenames, !files.isEmpty else { return false }
             let hfsPaths = files.compactMap { posixPath -> String? in
                 let url = URL(fileURLWithPath: posixPath) as CFURL
                 return CFURLCopyFileSystemPath(url, CFURLPathStyle(rawValue: 1)!) as String?
             }
             let text = hfsPaths.joined(separator: "\n")
-            await replaceClipWithString(text, for: entry, shouldPaste: executionContext.shouldPaste)
+            await replaceClipWithString(text, shouldPaste: executionContext.shouldPaste)
+            return true
 
         default:
-            break
+            return false
         }
     }
 
-    private func replaceClipWithString(_ string: String, for entry: ClipEntry, shouldPaste: Bool) async {
+    private func replaceClipWithString(_ string: String, shouldPaste: Bool) async {
         guard let context else { return }
 
         await MainActor.run {

@@ -4,8 +4,8 @@ import Foundation
 
 /// Actions tab in the Preferences window.
 ///
-/// Covers: enable toggle, modifier-click behaviours, invoke-immediately.
-/// Reference: `legacy/Source/PrefsWindowController.{h,m}` Actions tab.
+/// Covers: enable toggle, action-menu modifier key, invoke-immediately,
+/// and the action menu editor.
 struct ActionsPrefsView: View {
 
     @Environment(ClipMenuSettings.self) private var settings
@@ -18,12 +18,6 @@ struct ActionsPrefsView: View {
     @State private var selectedNodeID: PersistentIdentifier?
     @State private var selectedCatalogID: String?
     @State private var rightTab: RightTab = .builtin
-
-    private struct ClickBehaviorOption: Identifiable {
-        let id: String
-        let title: String
-        let value: String
-    }
 
     private enum RightTab: String, CaseIterable {
         case builtin = "Built-in"
@@ -53,47 +47,41 @@ struct ActionsPrefsView: View {
 
     var body: some View {
         @Bindable var s = settings
-        VStack(spacing: 12) {
-            Form {
-                Section("Action System") {
-                    Toggle("Enable actions", isOn: $s.enableAction)
-                    Toggle("Invoke action immediately when only one is available",
-                           isOn: $s.invokeActionImmediately)
-                        .disabled(!settings.enableAction)
-                }
+        VStack(alignment: .leading, spacing: 12) {
+            GroupBox {
+                HStack(spacing: 12) {
+                    Text("Hold this key while choosing a clip or snippet to open the action menu.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
 
-                Section("Modified-Click Behaviour") {
-                    clickBehaviorPicker("Control+click", binding: $s.controlClickBehavior)
-                    clickBehaviorPicker("Shift+click",   binding: $s.shiftClickBehavior)
-                    clickBehaviorPicker("Option+click",  binding: $s.optionClickBehavior)
-                    clickBehaviorPicker("Command+click", binding: $s.commandClickBehavior)
+                    Spacer(minLength: 8)
+
+                    Picker("", selection: $s.actionModifierKey) {
+                        Text("Command (⌘)").tag(1)
+                        Text("Option (⌥)").tag(0)
+                        Text("Control (⌃)").tag(2)
+                        Text("Shift (⇧)").tag(3)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
                 }
-                .disabled(!settings.enableAction)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
             }
-
-            Divider()
 
             Text("Action Menu")
                 .font(.headline)
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-            GeometryReader { proxy in
-                let spacing: CGFloat = 12
-                let controlsWidth: CGFloat = 120
-                let columnWidth = max(260, (proxy.size.width - controlsWidth - (spacing * 2)) / 2)
-
-                HStack(alignment: .top, spacing: spacing) {
-                    actionTreePane
-                        .frame(width: columnWidth)
-
-                    actionControlsPane
-                        .frame(width: controlsWidth)
-
-                    actionCatalogPane
-                        .frame(width: columnWidth)
-                }
+            HStack(alignment: .top, spacing: 12) {
+                actionTreePane
+                actionControlsPane
+                    .frame(width: 120)
+                actionCatalogPane
             }
-            .frame(minHeight: 320)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
             HStack(spacing: 8) {
                 Text("Name:")
@@ -110,8 +98,7 @@ struct ActionsPrefsView: View {
                 .disabled(selectedNode == nil)
             }
         }
-        .formStyle(.grouped)
-        .padding()
+        .padding(4)
         .onAppear {
             if selectedNodeID == nil {
                 selectedNodeID = rootNodes.first?.persistentModelID
@@ -125,22 +112,6 @@ struct ActionsPrefsView: View {
     }
 
     // MARK: - Helpers
-
-    /// Picker that maps between the stored behavior string and a display label.
-    /// Legacy values: "" (no-op), "popUpActionMenu" (show action menu).
-    @ViewBuilder
-    private func clickBehaviorPicker(_ label: String, binding: Binding<String>) -> some View {
-        let options = clickBehaviorOptions
-        Picker(label, selection: binding) {
-            ForEach(options) { option in
-                Text(option.title).tag(option.value)
-            }
-            if !options.contains(where: { $0.value == binding.wrappedValue }) {
-                Text("Custom action").tag(binding.wrappedValue)
-            }
-        }
-        .pickerStyle(.menu)
-    }
 
     private var actionTreePane: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -288,30 +259,6 @@ struct ActionsPrefsView: View {
 
         collect(catalogNodes)
         return result
-    }
-
-    private var clickBehaviorOptions: [ClickBehaviorOption] {
-        var options: [ClickBehaviorOption] = [
-            ClickBehaviorOption(id: "none", title: "No action", value: ""),
-            ClickBehaviorOption(id: "popup", title: "Show action menu", value: "popUpActionMenu"),
-        ]
-
-        let leaves = allNodes
-            .filter { $0.isLeaf && $0.isEnabled }
-            .sorted {
-                $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-            }
-
-        options.append(contentsOf: leaves.compactMap { node in
-            guard let behavior = serializedBehavior(for: node) else { return nil }
-            return ClickBehaviorOption(
-                id: nodeToken(node),
-                title: "Run \(node.title)",
-                value: behavior
-            )
-        })
-
-        return options
     }
 
     private var catalogNodes: [CatalogNode] {
@@ -688,31 +635,6 @@ struct ActionsPrefsView: View {
             current = node.parent
         }
         return false
-    }
-
-    // MARK: - Modifier behavior serialization
-
-    private func serializedBehavior(for node: ActionNode) -> String? {
-        guard node.isLeaf else { return nil }
-
-        var dict: [String: Any] = ["type": node.actionType ?? ""]
-        if let name = node.actionName, !name.isEmpty {
-            dict["name"] = name
-        }
-        if let path = node.scriptPath, !path.isEmpty {
-            dict["path"] = path
-        }
-        if let content = node.scriptContent, !content.isEmpty {
-            dict["content"] = content
-        }
-
-        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: []),
-              let json = String(data: data, encoding: .utf8)
-        else {
-            return nil
-        }
-
-        return json
     }
 }
 

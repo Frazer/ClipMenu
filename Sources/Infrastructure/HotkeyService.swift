@@ -2662,10 +2662,290 @@ private final class HotkeyPopupActionTarget: NSObject {
     private(set) var isFilterModeActive = false
     private var isSuppressingContentHighlight = false
     private let pasteService = PasteService()
+    /// Modifiers observed while the popup menu is open (flags can clear before the item action runs).
+    private var trackedModifierFlags: NSEvent.ModifierFlags = []
+    private var modifierMonitor: Any?
+    /// Menu tracking runs in `.eventTracking`; a local flagsChanged monitor alone often misses
+    /// modifier presses while the popup is already open over a clip.
+    private var modifierPollTimer: Timer?
+    /// Last row reported by `menu:willHighlight:` (more reliable than `highlightedItem` mid-tracking).
+    private weak var lastHighlightedMenuItem: NSMenuItem?
+    /// Clip/snippet row that currently has a dynamically attached actions submenu.
+    private weak var actionSubmenuHostItem: NSMenuItem?
+    private var actionSubmenuHostBackup: (action: Selector?, target: AnyObject?)?
+    /// Strong retain so choosing an action still works after we detach from the host row.
+    private var retainedActionSubmenu: NSMenu?
+    /// Keep the clip being acted on alive for the action menu's lifetime.
+    private var retainedActionTargetClip: ClipEntry?
 
     func beginSlashKeyMonitorIfNeeded() {
+        installModifierMonitorIfNeeded()
         guard filterSearchField != nil else { return }
         ClipMenuFilterKeyHook.setActiveTarget(self)
+    }
+
+    private func installModifierMonitorIfNeeded() {
+        guard modifierMonitor == nil else { return }
+        trackedModifierFlags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        modifierMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.flagsChanged, .leftMouseDown, .leftMouseUp, .rightMouseDown, .keyDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            self.trackedModifierFlags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            // Attach before click/Return so the cascade opens instead of dismissing ClipMenu.
+            if event.type == .flagsChanged || event.type == .leftMouseDown || event.type == .keyDown {
+                MainActor.assumeIsolated {
+                    self.refreshActionSubmenuAttachment()
+                }
+            }
+            return event
+        }
+
+        // Poll modifiers in the menu-tracking run loop so pressing the action key while
+        // already hovered still attaches/opens the cascade.
+        let timer = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                guard flags != self.trackedModifierFlags else { return }
+                self.trackedModifierFlags = flags
+                self.refreshActionSubmenuAttachment()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        RunLoop.main.add(timer, forMode: .default)
+        modifierPollTimer = timer
+    }
+
+    private func removeModifierMonitor() {
+        clearAttachedActionSubmenu()
+        lastHighlightedMenuItem = nil
+        modifierPollTimer?.invalidate()
+        modifierPollTimer = nil
+        if let modifierMonitor {
+            NSEvent.removeMonitor(modifierMonitor)
+            self.modifierMonitor = nil
+        }
+        trackedModifierFlags = []
+    }
+
+    private func selectionModifierFlags() -> NSEvent.ModifierFlags {
+        let fromEvent = (NSApp.currentEvent?.modifierFlags ?? []).intersection(.deviceIndependentFlagsMask)
+        let live = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return fromEvent.union(live).union(trackedModifierFlags)
+    }
+
+    private func isActionModifierHeld() -> Bool {
+        guard let runtime else { return false }
+        return selectionModifierFlags().contains(actionModifierMask(for: runtime.settings.actionModifierKey))
+    }
+
+    /// Attach/remove the actions submenu on the highlighted clip/snippet so it cascades
+    /// beside the still-open ClipMenu popup while the action modifier is held.
+    @MainActor
+    func refreshActionSubmenuAttachment(highlighted: NSMenuItem? = nil) {
+        if let highlighted {
+            lastHighlightedMenuItem = highlighted
+        }
+        // Prefer the live highlight argument, then last hovered row, then AppKit's idea of highlight.
+        // `willHighlight(nil)` is common when modifiers change — don't drop the hovered clip.
+        let item = highlighted
+            ?? lastHighlightedMenuItem
+            ?? findHighlightedMenuItem(in: filterRootMenu)
+        updateActionSubmenu(for: item)
+    }
+
+    private func findHighlightedMenuItem(in menu: NSMenu?) -> NSMenuItem? {
+        guard let menu else { return nil }
+        if let item = menu.highlightedItem {
+            if let submenu = item.submenu, let nested = findHighlightedMenuItem(in: submenu) {
+                return nested
+            }
+            return item
+        }
+        for child in menu.items {
+            if let submenu = child.submenu, let nested = findHighlightedMenuItem(in: submenu) {
+                return nested
+            }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func updateActionSubmenu(for item: NSMenuItem?) {
+        // Modifier summons the cascade; releasing it must NOT tear the menu down mid-choice.
+        if let host = actionSubmenuHostItem, host.submenu != nil {
+            if item == nil || item === host {
+                return
+            }
+            // Highlight moved into the actions submenu itself — keep showing.
+            if isItem(item!, inSubtreeOf: host.submenu) {
+                return
+            }
+            if actionTargetClip(from: item!) != nil {
+                // Different clip/snippet — retarget only while modifier is still held.
+                guard isActionModifierHeld() else { return }
+                clearAttachedActionSubmenu()
+            } else {
+                clearAttachedActionSubmenu()
+                return
+            }
+        }
+
+        guard isActionModifierHeld(),
+              let item,
+              let runtime,
+              let context = runtime.modelContainer?.mainContext,
+              let targetClip = actionTargetClip(from: item)
+        else {
+            return
+        }
+
+        // Folder rows already have real submenus — don't replace them.
+        if item.submenu != nil && actionSubmenuHostItem !== item {
+            return
+        }
+
+        if actionSubmenuHostItem === item, item.submenu != nil {
+            return
+        }
+
+        clearAttachedActionSubmenu()
+
+        let roots = (try? context.fetch(FetchDescriptor<ActionNode>(
+            predicate: #Predicate<ActionNode> { $0.parent == nil },
+            sortBy: [SortDescriptor(\.sortIndex)]
+        ))) ?? []
+        let enabledRoots = roots.filter(\.isEnabled)
+        let leaves = enabledLeafActions(from: enabledRoots)
+
+        // Single leaf still uses click-to-run; no submenu needed.
+        guard leaves.count != 1 else { return }
+
+        // Keep the live history clip (in the model context). An uninserted SwiftData
+        // snapshot often reads back nil fields, so the action no-ops and Cmd+V
+        // pastes the previous pasteboard contents.
+        retainedActionTargetClip = targetClip
+
+        let actionsMenu = ActionMenuBuilder.makeMenu(
+            from: enabledRoots,
+            target: targetClip,
+            service: runtime.actionService,
+            // Transform first; paste after we reactivate the app that invoked ClipMenu.
+            executionContext: .transformOnly,
+            postAction: { [weak self] in
+                await self?.finishHotkeyActionPaste()
+            }
+        )
+        actionsMenu.minimumWidth = 240.0
+        actionsMenu.autoenablesItems = false
+        if actionsMenu.items.isEmpty {
+            let empty = NSMenuItem(title: "No actions configured", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            actionsMenu.addItem(empty)
+        }
+
+        actionSubmenuHostBackup = (item.action, item.target)
+        // Submenu-only: click/→ opens the cascade and keeps ClipMenu visible.
+        item.action = nil
+        item.target = nil
+        item.submenu = actionsMenu
+        actionSubmenuHostItem = item
+        retainedActionSubmenu = actionsMenu
+
+        // AppKit won't notice a submenu attached after highlight — re-kick and open it.
+        rehighlightMenuItem(item)
+        openSubmenu(for: item)
+    }
+
+    private func isItem(_ item: NSMenuItem, inSubtreeOf menu: NSMenu?) -> Bool {
+        guard let menu else { return false }
+        for candidate in menu.items {
+            if candidate === item { return true }
+            if isItem(item, inSubtreeOf: candidate.submenu) { return true }
+        }
+        return false
+    }
+
+    private func clearAttachedActionSubmenu() {
+        guard actionSubmenuHostItem != nil || retainedActionSubmenu != nil else { return }
+        let host = actionSubmenuHostItem
+        let backup = actionSubmenuHostBackup
+        let retained = retainedActionSubmenu
+        let retainedClip = retainedActionTargetClip
+        actionSubmenuHostItem = nil
+        actionSubmenuHostBackup = nil
+
+        // Defer destruction so NSMenu can deliver the clicked item's action first.
+        DispatchQueue.main.async { [weak self] in
+            if let host {
+                if host.submenu === retained {
+                    host.submenu = nil
+                }
+                if let backup {
+                    host.action = backup.action
+                    host.target = backup.target
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.retainedActionSubmenu === retained {
+                    self.retainedActionSubmenu = nil
+                }
+                if self.retainedActionTargetClip === retainedClip {
+                    self.retainedActionTargetClip = nil
+                }
+            }
+        }
+    }
+
+    private func rehighlightMenuItem(_ item: NSMenuItem) {
+        guard let menu = item.menu else { return }
+        for name in ["highlightItem:", "_highlightItem:"] {
+            let sel = NSSelectorFromString(name)
+            guard menu.responds(to: sel) else { continue }
+            menu.perform(sel, with: nil)
+            menu.perform(sel, with: item)
+            return
+        }
+    }
+
+    private func openSubmenu(for item: NSMenuItem) {
+        guard let menu = item.menu, item.submenu != nil else { return }
+        for name in ["_openSubmenuForItem:", "openSubmenuForItem:"] {
+            let sel = NSSelectorFromString(name)
+            guard menu.responds(to: sel) else { continue }
+            menu.perform(sel, with: item)
+            return
+        }
+        // Fallback: right-arrow opens the highlighted item's submenu.
+        let winNum = NSApp.keyWindow?.windowNumber ?? 0
+        guard let event = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: winNum,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: 124
+        ) else { return }
+        NSApp.postEvent(event, atStart: false)
+    }
+
+    private func actionTargetClip(from item: NSMenuItem) -> ClipEntry? {
+        if let clip = item.representedObject as? ClipEntry {
+            return clip
+        }
+        if let snippet = item.representedObject as? Snippet {
+            let mock = ClipEntry()
+            mock.stringValue = snippet.content
+            mock.types = ["public.utf8-plain-text"]
+            return mock
+        }
+        return nil
     }
 
     /// Called from the CGEvent tap on the main thread. Return true to swallow the key.
@@ -2801,7 +3081,13 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     /// Mouse highlight: hovering the filter row can enter filter mode. While filtering,
     /// content-row hover must NOT exit filter mode (mouse often still sits on row 1 after `/`).
+    @MainActor
     func clipMenuWillHighlight(menu: NSMenu, item: NSMenuItem?) {
+        defer {
+            if !isFilterModeActive {
+                refreshActionSubmenuAttachment(highlighted: item)
+            }
+        }
         guard let field = filterSearchField, let filterItem = filterTitleMenuItem else { return }
         let isFilterRow = item === filterItem
             || (item?.view != nil && field.isDescendant(of: item!.view!))
@@ -2825,6 +3111,7 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     func clipMenuFilterMenuDidClose() {
         isFilterModeActive = false
+        removeModifierMonitor()
         ClipMenuFilterKeyHook.clearActiveTarget(self)
         filterSearchField?.releaseTypingCaptureForMenuNavigation()
         if let field = filterSearchField {
@@ -2866,57 +3153,54 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     @objc func selectClipMenuItem(_ sender: NSMenuItem) {
         guard let clip = sender.representedObject as? ClipEntry, let runtime else { return }
-        
-        let mask: NSEvent.ModifierFlags
-        switch runtime.settings.actionModifierKey {
-        case 1: mask = .command
-        case 2: mask = .control
-        case 3: mask = .shift
-        default: mask = .option
-        }
-        
-        if NSEvent.modifierFlags.contains(mask) {
-            handleActionPopup(for: clip, runtime: runtime)
+
+        let wantsActions = selectionModifierFlags().contains(actionModifierMask(for: runtime.settings.actionModifierKey))
+        fputs("[ClipMenu] selectClip wantsActions=\(wantsActions) flags=\(selectionModifierFlags().rawValue) tracked=\(trackedModifierFlags.rawValue)\n", stderr)
+        if wantsActions {
+            // Multi-action uses the cascading submenu (parent stays open). Only auto-run
+            // when there is a single leaf; otherwise ignore so we don't dismiss for a second menu.
+            handleSingleLeafActionIfNeeded(for: clip, runtime: runtime)
         } else {
             selectClipEntry(clip)
         }
     }
 
-    private func handleActionPopup(for clip: ClipEntry, runtime: AppRuntime) {
+    private func actionModifierMask(for key: Int) -> NSEvent.ModifierFlags {
+        switch key {
+        case 1: return .command
+        case 2: return .control
+        case 3: return .shift
+        default: return .option
+        }
+    }
+
+    private func handleSingleLeafActionIfNeeded(for clip: ClipEntry, runtime: AppRuntime) {
         Task { @MainActor in
             guard let context = runtime.modelContainer?.mainContext else { return }
             let roots = (try? context.fetch(FetchDescriptor<ActionNode>(
                 predicate: #Predicate<ActionNode> { $0.parent == nil },
                 sortBy: [SortDescriptor(\.sortIndex)]
             ))) ?? []
-            
-            let actionsMenu = ActionMenuBuilder.makeMenu(
-                from: roots,
-                target: clip,
-                service: runtime.actionService,
-                // Using .pasteContext means it executes the action and dumps to pasteboard
-                executionContext: .pasteContext,
-                postAction: { [weak self] in
-                    await self?.pasteFromHotkeyAction()
-                }
-            )
-            actionsMenu.minimumWidth = 240.0
-            
-            if actionsMenu.items.isEmpty {
-                let empty = NSMenuItem(title: "No actions configured", action: nil, keyEquivalent: "")
-                empty.isEnabled = false
-                actionsMenu.addItem(empty)
-            } else {
-                let titleItem = NSMenuItem(title: "Actions for selected clip", action: nil, keyEquivalent: "")
-                titleItem.isEnabled = false
-                actionsMenu.insertItem(titleItem, at: 0)
-                actionsMenu.insertItem(.separator(), at: 1)
-            }
-            
-            // Allow the main popup to vanish completely before triggering a new run loop popup
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            actionsMenu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+            let leaves = enabledLeafActions(from: roots.filter(\.isEnabled))
+            guard leaves.count == 1, let only = leaves.first else { return }
+            await runtime.actionService.perform(action: only, on: clip, executionContext: .pasteContext)
+            await pasteFromHotkeyAction()
         }
+    }
+
+    private func enabledLeafActions(from roots: [ActionNode]) -> [ActionNode] {
+        var leaves: [ActionNode] = []
+        func walk(_ nodes: [ActionNode]) {
+            for node in nodes where node.isEnabled {
+                if node.isLeaf {
+                    leaves.append(node)
+                } else {
+                    walk(Array(node.children))
+                }
+            }
+        }
+        walk(roots)
+        return leaves
     }
 
     func selectClipEntry(_ clip: ClipEntry) {
@@ -2938,20 +3222,12 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     @objc func selectSnippetMenuItem(_ sender: NSMenuItem) {
         guard let snippet = sender.representedObject as? Snippet, let runtime else { return }
-        
-        let mask: NSEvent.ModifierFlags
-        switch runtime.settings.actionModifierKey {
-        case 1: mask = .command
-        case 2: mask = .control
-        case 3: mask = .shift
-        default: mask = .option
-        }
-        
-        if NSEvent.modifierFlags.contains(mask) {
+
+        if selectionModifierFlags().contains(actionModifierMask(for: runtime.settings.actionModifierKey)) {
             let mockClip = ClipEntry()
             mockClip.stringValue = snippet.content
             mockClip.types = ["public.utf8-plain-text"]
-            handleActionPopup(for: mockClip, runtime: runtime)
+            handleSingleLeafActionIfNeeded(for: mockClip, runtime: runtime)
         } else {
             selectSnippetModel(snippet)
         }
@@ -2997,6 +3273,15 @@ private final class HotkeyPopupActionTarget: NSObject {
 
     @MainActor
     func pasteFromHotkeyAction() async {
+        await pasteService.paste()
+    }
+
+    @MainActor
+    private func finishHotkeyActionPaste() async {
+        reactivateTargetAppIfNeeded()
+        try? await Task.sleep(nanoseconds: Self.reactivationSettleDelay)
+        reactivateTargetAppIfNeeded()
+        try? await Task.sleep(nanoseconds: Self.prePasteDelay)
         await pasteService.paste()
     }
 }
